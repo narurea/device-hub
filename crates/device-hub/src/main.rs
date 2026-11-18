@@ -7,6 +7,9 @@
 //! 環境変数:
 //!   DEVHUB_DEMO=1  常にデモデバイス
 //!   DEVHUB_FAST=1  GPU ガラスを切る (フォールバック確認)
+//!
+//! 引数:
+//!   --background   窓を出さずにタスクトレイへ常駐して起動 (スタートアップ登録が付ける)
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
@@ -28,7 +31,14 @@ fn main() {
         .run(|cx| {
             gpui_kit::init(cx);
             // フォント登録は選択の後 — 使う書体だけ載せて常駐メモリを削る。
-            let prefs = Prefs::load();
+            let mut prefs = Prefs::load();
+            // 常駐: タスクトレイを出し、初回だけスタートアップ登録 (設定で外せる)。
+            if device_hub::resident::init(&mut prefs) {
+                prefs.save();
+            }
+            // ログイン時の自動起動 (--background) は窓を出さずトレイに入れておく。
+            let hidden_start = device_hub::resident::started_in_background()
+                && device_hub::resident::tray_active();
             theme::set_font_id(&prefs.font);
             theme::install_fonts(cx);
             let light = prefs.light();
@@ -54,6 +64,10 @@ fn main() {
             // 背面に回ったら描画を間引く (ゲームの邪魔をしない)。
             options.inactive_frame_interval = Some(std::time::Duration::from_millis(250));
             options.app_id = Some("devicehub".into());
+            if hidden_start {
+                options.show = false;
+                options.focus = false;
+            }
             // 窓キャプション — タスクマネージャーと Alt+Tab の表示名になる。
             if let Some(tb) = options.titlebar.as_mut() {
                 tb.title = Some("Device HUB".into());
@@ -65,6 +79,7 @@ fn main() {
             .expect("failed to open window");
             cx.on_window_closed(|cx, _| {
                 if cx.windows().is_empty() {
+                    device_hub::resident::remove_tray();
                     cx.quit();
                 }
             })

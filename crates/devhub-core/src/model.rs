@@ -72,6 +72,12 @@ pub enum DriverKind {
     Atk,
     /// www.lamzu.net / Aurora 系 (64B feature report、if2 FFFF:00)。
     Lamzu,
+    /// Logitech G HUB 置換 — HID++ 2.0 (long report 0x11、FF00:02)。
+    /// 機能は feature index の問い合わせで決まるので、Lightspeed 受信機経由の
+    /// 他の HID++ 2.0 マウスもそのまま動く (オンボードプロファイル 0x8100 で保存)。
+    Logitech,
+    /// MonsGeek / Akko 磁気軸キーボード (RongYuan RY5088、64B feature report、FFFF:02)。
+    Monsgeek,
     /// 未割り当て (検出だけできる)。
     Unsupported,
 }

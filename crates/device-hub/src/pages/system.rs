@@ -56,6 +56,8 @@ impl Shell {
                         DriverKind::Walkplay => "WalkPlay (peq.szwalkplay.com 互換)".into(),
                         DriverKind::Atk => "ATK HUB 互換".into(),
                         DriverKind::Lamzu => "LAMZU Aurora 互換".into(),
+                        DriverKind::Logitech => "Logitech HID++ 2.0 (G HUB 置換)".into(),
+                        DriverKind::Monsgeek => "MonsGeek RY5088 (app.monsgeek.com 互換)".into(),
                         DriverKind::Unsupported => "未対応".into(),
                     },
                 ))

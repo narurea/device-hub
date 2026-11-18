@@ -22,6 +22,12 @@ use std::sync::{Arc, Mutex};
 pub mod atk;
 #[doc(hidden)]
 pub mod lamzu;
+/// Logitech HID++ 2.0 (G HUB 置換)。診断 example (lgprobe) からも使うので公開。
+#[doc(hidden)]
+pub mod logitech;
+/// MonsGeek RY5088 系磁気軸キーボード。診断 example (mgprobe) からも使うので公開。
+#[doc(hidden)]
+pub mod monsgeek;
 #[allow(dead_code)]
 mod mousefit;
 mod mousefit8;
@@ -52,6 +58,8 @@ fn driver_ready(kind: DriverKind) -> bool {
         DriverKind::Walkplay => true,
         DriverKind::Atk => true,
         DriverKind::Lamzu => true,
+        DriverKind::Logitech => true,
+        DriverKind::Monsgeek => true,
         DriverKind::Unsupported => false,
     }
 }
@@ -224,6 +232,8 @@ impl HubBackend for RealHub {
             DriverKind::Walkplay => Arc::new(walkplay::open(dev, info)?),
             DriverKind::Atk => Arc::new(atk::open(dev, info, events)?),
             DriverKind::Lamzu => Arc::new(lamzu::open(dev, info, events)?),
+            DriverKind::Logitech => Arc::new(logitech::open(dev, info, events)?),
+            DriverKind::Monsgeek => Arc::new(monsgeek::open(dev, info)?),
             DriverKind::Unsupported => {
                 return Err(HubError::NotImplemented("このデバイスのドライバ"))
             }

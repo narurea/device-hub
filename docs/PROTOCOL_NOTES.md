@@ -1104,3 +1104,177 @@ get/set は cmd が +0x80/同一値の関係。`devID` はプロファイル番�
 - 公式の日本語表示名: 移動同期 / 直線補正 / リップル / LOD / ガラスモード / 20K FPS / 競技モード / 角度調整 /
   スリープ時間 / スクロールBhop / ホイール応答時間 / デバウンスタイム / 高速トリガー / ドングルLED (信号) /
   プロファイルをリセット / 完全初期化。X-Y軸分離は DPI タブの X/Y 切り替えで扱う (設定行には出さない)。
+
+## 6. Logitech G HUB 置換 — HID++ 2.0 (PRO X SUPERLIGHT 2)
+
+**状態: 実装済・実機未検証** (`crates/devhub-hid/src/logitech.rs`)。G HUB 本体は解析していない。
+HID++ 2.0 は公開資料・OSS 実装から仕様を起こした (コードは独自実装):
+
+- libratbag `src/hidpp20.c` / `driver-hidpp20.c` (MIT) — 0x8100 のセクタ形式・ボタン 4 バイト・CRC・ディレクトリ/ROM
+- Solaar `lib/logitech_receiver/hidpp20.py` / `settings_templates.py` (GPL、事実のみ) — 0x8061・0x1004・0x0003
+- libratbag の SL2 定義 `usb:046d:40a9;usb:046d:c09b` と Linux `hid-logitech-dj` のパッチ (受信機 `0xc54d`)
+
+### 6.1 識別
+
+| 接続 | VID:PID | コレクション | device index |
+|---|---|---|---|
+| 有線 | 046D:C09B | FF00 / 0002 (long) | 0xFF |
+| SL2 受信機 | 046D:C54D | FF00 / 0002 | 1 (1..6 を ping で確定) |
+| 汎用 LIGHTSPEED 受信機 | 046D:C547 | FF00 / 0002 | 1 (名前は 0x0005 で取り直す) |
+
+Windows では short (0x10, FF00/0001) と long (0x11, FF00/0002) が別コレクション。ドライバは long だけで話す。
+
+### 6.2 フレーム
+
+```
+要求  [0x11, dev_idx, feat_idx, (func<<4)|sw_id, params×16]   (20B, sw_id = 0x0B)
+応答  同じヘッダ + 16B
+エラー [0x11, dev_idx, 0xFF, feat_idx, (func<<4)|sw_id, code]  1 unknown 2 invalid arg 3 out of range … 8 busy 9 unsupported
+```
+
+feature index は ROOT (index 0) fn0 `getFeature(id BE16)` → `[index, type, version]`。ping は ROOT fn1 (3 バイト目がエコー)。
+受信機経由で応答が無ければマウス休眠 → `DeviceInfo.asleep` + `HubEvent::Info`、次の応答で `StateChanged`。
+
+### 6.3 使う feature
+
+| id | 名前 | fn | 用途 |
+|---|---|---|---|
+| 0x0003 | DeviceFwVersion | 0 count / 1 info(entity) | `[type, 名前3, major BCD, minor BCD, build BE16]` (type&0xF=0 が本体) |
+| 0x0005 | DeviceName | 0 長さ / 1 部分(offset) | 表示名 |
+| 0x1004 | UnifiedBattery | 1 status | `[%, level bit, 充電状態 0放電/1充電/2ほぼ満/3満/4低速充電, 外部電源]` |
+| 0x1000 | BatteryStatus | 0 | `[%, next, status]` (0x1004 が無い機種) |
+| 0x2201 | AdjustableDPI | 1 list(sensor) / 2 get / 3 set | 範囲 `[min, 0xE000|step, max, 0]` |
+| 0x8061 | ExtAdjustableReportRate | 1 list (BE16 bit i) / 2 get / 3 set(index) | index 0=125 … 3=1000, 4=2000, 5=4000, 6=8000 |
+| 0x8060 | AdjustableReportRate | 0 list (bit n-1 = n ms) / 1 get / 2 set(ms) | 1000Hz 以下の旧機種 |
+| 0x8100 | OnboardProfiles | 下表 | DPI・ボタン・レート (本体保存) |
+
+0x8100: fn0 説明 / 1 setMode (1=onboard, 2=host) / 2 getMode / 3 setCurrentProfile(BE16 sector) /
+4 getCurrentProfile / 5 memRead(sector, offset → 16B) / 6 memAddrWrite(sector, offset, len) /
+7 memWrite(16B) / 8 memWriteEnd / 0xB getCurrentDpiIndex / 0xC setCurrentDpiIndex。
+
+説明 (fn0): `[memory_model=1, profile_format 1..5, macro_format, profile_count, rom_count, button_count, sector_count, sector_size BE16, mech_layout, various]`。
+
+### 6.4 オンボードメモリ
+
+- sector 0 = ユーザーディレクトリ `[addr BE16, enabled, 0]…, FFFF 0000, FF…, CRC`。全 0 / 全 FF / CRC 不正なら
+  未初期化 → **ROM ディレクトリ (0x0100)** と ROM プロファイル (0x0101..) を使う。
+- 書き込み時にユーザー領域が未初期化なら、ROM の各プロファイルを sector 1..n に写してからディレクトリを書く
+  (libratbag の commit と同じ形)。以後はアクティブプロファイルの RMW (読み→変更→CRC→書き→`setCurrentProfile` で再読込)。
+- CRC = CRC-16/CCITT-FALSE (init 0xFFFF, poly 0x1021)、セクタ末尾 2B に BE。
+- 読み出しは 16B 単位。末尾は `size-16` から読む (それ以降を指すと INVALID_ARGUMENT)。
+
+プロファイル (256B):
+
+| off | 内容 |
+|---|---|
+| 0 | report rate = 1 報告あたり ms (1/2/4/8)。2000Hz 以上は 0x8061 側 |
+| 1 / 2 | 既定 DPI index / DPI シフト index |
+| 3..13 | DPI ×5 (LE16、0 = 未使用) |
+| 13..16 / 16 / 17 | 色 / power mode / angle snap |
+| 28 / 30 | 省電力 / 電源断タイマ (LE16) |
+| 32..96 | ボタン ×16 (4B) |
+| 96..160 | G-Shift ボタン ×16 |
+| 160..208 | 名前 UTF-16LE 24 文字 (全 FF = 未設定) |
+| 208.. | LED (SL2 は無し) … 末尾 2B CRC |
+
+ボタン 4B:
+
+| バイト | 意味 |
+|---|---|
+| `80 01 mask(BE16)` | マウスボタン (bit0 左 1 右 2 中 3 戻る 4 進む 6/7 チルト) |
+| `80 02 mods usage` | キー (+修飾) |
+| `80 03 usage(BE16)` | コンシューマ (メディア) |
+| `80 00 …` / `FF FF FF FF` | 何もしない / 無効 |
+| `90 sp 00 prof` | 特殊: 01/02 チルト左右, 03/04 DPI ±, 05 DPI 循環, 06 既定 DPI, 07 DPI シフト, 08/09/0A プロファイル ±/循環, 0B G-Shift, 0C 電池, 10/11 スクロール下/上 |
+| `0n …` | マクロ (アプリでは往復保存のみ・新規作成は未対応) |
+
+DPI シフト (`90 07`) は「プロファイルの DPI 枠 (shift index) の値」へ切り替わる。アプリは同じ DPI のステージがあればその
+index、無ければステージの後ろの空き枠に値を入れて index を指す。
+
+### 6.5 G HUB からの移行で起きること
+
+- 開いたとき getMode が host (2) なら **onboard (1) に戻す** — G HUB が残したホストモードでは本体保存の設定が効かないため。
+- G HUB は無効化/終了しておくこと (HID++ を取り合う)。
+- 要実機確認: SL2 が 0x2201 と 0x2202 のどちらを持つか (無ければ DPI 範囲は 100–32000/50 刻みの仮値)、
+  プロファイル形式番号、0x8061 の 8K がオンボードモードで受理されるか、ボタン数 (仮 5)。
+  `cargo run -p devhub-hid --example lgprobe` (読み取り専用) で feature 一覧とセクタを確認できる。
+
+## 7. MonsGeek / Akko — RongYuan RY5088 (FUN60 Ultra)
+
+**状態: 実装済・実機未検証** (`crates/devhub-hid/src/monsgeek.rs`)。出典:
+
+- 公式 Web ドライバ (app.monsgeek.com) の `CommonKBRY5088` クラス — echtzeit-solutions/monsgeek-akko-linux が保存・解析した
+  `protocol/hid_protocol_core.js` を読み、コマンド・フレーム・ページ形式を確認
+- 同プロジェクト `docs/PROTOCOL.md` (GPL、事実のみ参照)・公式デバイス DB (`data/devices.json` / `device_matrices.json`)
+
+### 7.1 識別
+
+| 機種 | VID:PID | device id (0x8F) |
+|---|---|---|
+| FUN60 Ultra | 3151:5029 / 502D / 5030 | 2352 / 2381 / 2307・2387 |
+| FUN60 / PRO / MAX (同配置 Common61_gk06) | 同上 | 2299 / 2304 / 2305 / 2306 / 2464 / 2600 / 2785 / 3299 |
+
+PID は M1 V5 HE などと共有 → registry は PID で開き、`GET_USB_VERSION` (0x8F) の **device id** で機種を確定。
+未知の id はキーマトリクスから並びだけ作る (位置 = 列×6+行)。設定 IF = interface 2、usage FFFF:02、
+64B feature report (report ID 0)。ドングル (5037/5038/503A) は `0xFC` で応答を取り出す別手順 — 未対応。
+
+### 7.2 フレームとチェックサム
+
+```
+送信 [cmd, p1..p6, ck, payload(56B)]   Bit7: ck = 255 - (Σ f[0..7] & 0xFF)
+LED  [0x07, mode, 4-speed, bright, opt, R, G, B, ck]   Bit8: ck = 255 - (Σ f[0..8])
+```
+
+応答は GET_FEATURE。0x8x 系は f[0] にエコー、**0x8A (キーマトリクス) と 0xE5 (磁気軸) はエコー無しの生 64B**。
+SET は ACK を返さない (送信成功で受理とみなす。公式も `vendorSleep` で待つだけ)。
+
+### 7.3 コマンド
+
+| cmd | 内容 | 形式 |
+|---|---|---|
+| 0x8F | 版 | `[8F, id u32 LE, ?, ?, fw u16 LE]` — fw は精度係数・上端 DZ の判定に使う |
+| 0x83 / 0x03 | ポーリング | 値は **f[2]** (f[1] は予約 0)。0=8000 1=4000 2=2000 3=1000 4=500 5=250 6=125 |
+| 0x84 / 0x04 | プロファイル 0..3 | |
+| 0x86 / 0x06 | デバウンス ms | f[1] |
+| 0x87 / 0x07 | LED | mode, 4-speed, 明るさ 0..4, opt = 方向<<4 \| (8 = レインボー / 7 = 単色), RGB (白は FA FF FA で送る) |
+| 0x89 / 0x09 | KB オプション | `[os, fn, 誤操作防止, RT 安定 level(×25ms), WASD 入替]` — フィールド単位の SET は無いので RMW |
+| 0x8A / 0x0A | キーマトリクス | GET `[8A, profile, FF, page 0..7, layer]` → 64B×8 = 128 位置×4B。SET (simple) `[0A, profile, pos, 0, 0, 1, layer, ck, b0..b3]` |
+| 0xE5 / 0x65 | 磁気軸 | 下表 |
+| 0x1C / 0x1E | キャリブレーション | 最小 (離した状態) 開始=1/停止=0、最大 (全キー底打ち) 開始=1/停止=0 |
+| 0x01 | 工場出荷 | 2 秒待つ |
+
+LED mode: 0 消灯 1 常時 2 呼吸 3 ネオン 4 ウェーブ 5 リップル 6 雨粒 7 スネーク 8 押下点灯 9 収束 10 サイン 11 万華鏡
+12 ラインウェーブ 13 ユーザー画像 14 レーザー 15 サークル 16 レインボー 17 レインダウン 18 流星 19 押下消灯
+20/22 音楽 (ホスト送信) 21 画面同期 23 トレイン 24 花火 25 GIF。アプリは 13/20/21/22/25 を出さない。
+
+キーマトリクス 4B: `[0, mods, usage, 0]` キー、`[1, 0, 240..248, x]` マウス (240 左 241 右 242 中 243 戻る 244 進む 245 ホイール ±)、
+`[3, 0, usage LE16]` コンシューマ、`[10, 1, 0, 0]` Fn、`[9, type, idx, 0]` マクロ。アプリのコードは基本キー = usage、
+それ以外 = 4B を BE で詰めた u32。
+
+### 7.4 磁気軸テーブル
+
+GET `[E5, sub, 1, page]` → 生 64B。SET 一括 `[65, sub, 1, page, commit, 0, 0, ck, 56B]`、commit は **バッチ最後のページだけ 1**
+(そこでフラッシュ保存。直後の読み戻しは 200ms 以上待たないと化ける)。SET 単キー `[65, sub, 0, pos, commit, 0, 0, ck, 値]`。
+
+| sub | 内容 | 型 (128 位置) |
+|---|---|---|
+| 0x00 / 0x01 | 作動点 / リリース点 | u16 LE (4 ページ読み・5 ページ書き) |
+| 0x02 / 0x03 | RT 押し / 戻し感度 | u16 |
+| 0x06 | 下端デッドゾーン | u16 |
+| 0x07 | キーモード: bit7 = RT、下位 0 Normal 2 DKS 3 MT 4 TGL-hold 5 TGL-dots 7 SnapTap | u8 (2 ページ読み・3 ページ書き) |
+| 0xFB | 上端デッドゾーン (fw ≥ 1024) | **u8** |
+
+値 = mm × 係数。係数は fw 版で決まる: < 768 → 10、768–1279 → 100、≥ 1280 → 200 (公式 `get磁轴行程步进倍数`)。
+アプリはキーモードの下位 (DKS 等) を保ったまま RT ビットだけ切り替える。
+
+### 7.5 FUN60 Ultra のキー位置
+
+公式 DB の既定マトリクス (layout fallback) から: 位置 = 列×6+行 (行 0..5)。Esc=1, Tab=2, Caps=3, LShift=4, LCtrl=5,
+1=7, Q=8, A=9, LWin=17, Z=16, LAlt=23, Space=41, Backspace=79, \=80, Enter=81, RShift=76, RAlt=65, Menu=77, RCtrl=83 …
+(`registry::fun60_layout` / `FUN60_DEFAULT_MATRIX`)。Fn はマトリクス外。**実機で要確認**:
+`cargo run -p devhub-hid --example mgprobe` (読み取り専用) で版・LED・先頭キーのトラベルを表示する。
+
+### 7.6 未対応
+
+DKS / Mod-Tap / トグル / SnapTap の編集 (読み書きの形式は §7.4 と公式 JS で分かっている)、マクロ、Fn レイヤー (0x10/0x90)、
+ユーザー画像 (0x0C)、キー深さのライブ表示 (0x1B 通知は別 IF の input report)、2.4GHz ドングル経由。

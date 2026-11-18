@@ -15,6 +15,8 @@
 | HTS Plus Pro (有線) | 33E4:5219 | FF02 / 02 | Mousefit → `mousefit8.rs` (report-8/EEPROM) | www.mouse.fit | **v2 実機検証済** (有線でも feature report は使えず report-8) |
 | HTX Ultra | 33E4:5608, 5617, 5618, 5619 | FF02 / 02 (推定) | Mousefit | www.mouse.fit | 機種表から登録 / 未検証 |
 | ATK F1 Ultimate | 未確定 | 未確定 | 未確定 | (mouse.fit の機種表に無い) | §7 を参照 |
+| Logitech PRO X SUPERLIGHT 2 | 046D:C09B (有線) / C54D (受信機) / C547 (汎用 LIGHTSPEED) | FF00 / 02 | Logitech (`logitech.rs`, HID++ 2.0) | G HUB | 実装済・**実機未検証** (DPI・ボタン・レート・プロファイル・電池。PROTOCOL_NOTES §6) |
+| MonsGeek FUN60 Ultra | 3151:5029 / 502D / 5030 | FFFF / 02 | Monsgeek (`monsgeek.rs`, RY5088) | app.monsgeek.com | 実装済・**実機未検証** (ライティング・RT・作動点・DZ・キーマップ・ポーリング・キャリブ。PROTOCOL_NOTES §7) |
 
 **接続方式でプロトコルが変わる点に注意**: mouse.fit の新プロトコル (64B feature report) は
 有線機種専用 — 8K ドングルは Windows の feature report を一切持たず、ドングル経由は

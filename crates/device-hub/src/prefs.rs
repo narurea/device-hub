@@ -38,6 +38,10 @@ pub struct Prefs {
     /// プロセス監視ルール (フォアグラウンド連動でプロファイルを適用)。
     #[serde(default)]
     pub proc_rules: Vec<ProcRule>,
+    /// × で閉じてもタスクトレイに常駐する (G HUB と同じ動き。既定 ON)。
+    pub close_to_tray: bool,
+    /// 初回起動でスタートアップ登録を済ませたか (以降はユーザーの選択を尊重する)。
+    pub autostart_initialized: bool,
 }
 
 /// 設定プロファイル — 録画した `Change` を順に再生して適用する。
@@ -140,6 +144,8 @@ impl Default for Prefs {
             livefx: Default::default(),
             profiles: vec![],
             proc_rules: vec![],
+            close_to_tray: true,
+            autostart_initialized: false,
         }
     }
 }

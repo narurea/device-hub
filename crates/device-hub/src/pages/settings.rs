@@ -260,13 +260,56 @@ impl Shell {
                 )),
         );
 
+        let tray_on = crate::resident::tray_active();
+        let resident = ui::card_titled("常駐 (常時起動)", "power", None).child(
+            ui::body()
+                .pb(px(12.))
+                .child(ui::row_first(
+                    "Windows 起動時に自動で起動",
+                    Some("ログイン時にタスクトレイへ常駐して起動します (窓は出しません)。G HUB の代わりに常時動かす想定"),
+                    ui::toggle(
+                        "autostart",
+                        crate::resident::autostart_enabled(),
+                        cx,
+                        |this, on, cx| {
+                            if let Err(e) = crate::resident::set_autostart(on) {
+                                this.toast(e, true, cx);
+                            }
+                            cx.notify();
+                        },
+                    ),
+                ))
+                .child(ui::row(
+                    "閉じてもタスクトレイに常駐",
+                    Some(if tray_on {
+                        "× で閉じても裏で動き続けます (自動プロファイル切替・電池監視を継続)。トレイのアイコンから開く/終了"
+                    } else {
+                        "タスクトレイを使えないため、× で閉じると終了します"
+                    }),
+                    ui::toggle(
+                        "close-to-tray",
+                        self.prefs.close_to_tray,
+                        cx,
+                        |this, on, cx| {
+                            this.prefs.close_to_tray = on;
+                            this.prefs.save();
+                            crate::resident::set_close_to_tray(on);
+                            if on {
+                                crate::resident::start_tray();
+                            }
+                            cx.notify();
+                        },
+                    ),
+                )),
+        );
+
         let about = ui::card_titled("このアプリについて", "info", None).child(
             ui::body()
                 .pb(px(14.))
                 .gap(px(6.))
                 .pt(px(4.))
                 .child(ui::sub(format!("Device Hub {}", env!("CARGO_PKG_VERSION"))))
-                .child(ui::faint("mouse.fit / hub.xsyd.top の設定をブラウザなしで行うための個人用ツール。GPUI + Liquid Glass。"))
+                .child(ui::faint("mouse.fit / hub.xsyd.top / G HUB / MonsGeek の設定をブラウザ・公式アプリなしで行うための個人用ツール。GPUI + Liquid Glass。"))
                 .child(ui::faint("新しいデバイスの追加方法: docs/ADD_DEVICE.md")),
         );
 
@@ -287,6 +330,7 @@ impl Shell {
                         look.into_any_element(),
                         backend.into_any_element(),
                         fw.into_any_element(),
+                        resident.into_any_element(),
                         about.into_any_element(),
                     ])),
             )

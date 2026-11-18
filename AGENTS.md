@@ -1,7 +1,8 @@
 # GPUI Device HUB
 
-ブラウザ (www.mouse.fit / hub.xsyd.top) を開きっぱなしにせずにマウス・キーボードを設定する、
-Windows 用の個人 GPUI アプリ。デザインは Liquid Glass。
+ブラウザ (www.mouse.fit / hub.xsyd.top) や公式アプリ (Logitech G HUB / MonsGeek) を使わずに
+マウス・キーボードを設定する、Windows 用の個人 GPUI アプリ。デザインは Liquid Glass。
+既定で常駐する (スタートアップ登録 + タスクトレイ、× で閉じても裏で動く — `device-hub/src/resident.rs`)。
 
 ## 構成
 
@@ -54,6 +55,10 @@ docs/FRONTEND.md        フロントエンドの構造
   プロファイル4・工場リセット — いずれも往復確認。**ドングル 373b:1278** は同一 16B プロトコル
   中継 + cmd29 ドングル FW + 休眠検知 (asleep/HubEvent・覚醒で CID/MID 再確定)。
   未対応: マクロ @768・dynamicSensitivity・sensorAngle・BT・FW 更新 — §4)。
+- 追加 (2026-11-18、**実機未検証**): `logitech.rs` — G HUB 置換 (HID++ 2.0。SL2 有線 C09B / 受信機 C54D・C547。
+  オンボードプロファイル 0x8100 で DPI・ボタン割り当て・レートを本体保存、0x8061 で 8K)、
+  `monsgeek.rs` — FUN60 Ultra (RY5088。ライティング・RT・作動点/リリース・上下 DZ・キーマップ・ポーリング・
+  KB オプション・キャリブレーション)。PROTOCOL_NOTES §6/§7、読み取り専用診断 example `lgprobe` / `mgprobe`。
 
 ## ビルド / 実行
 
@@ -63,6 +68,8 @@ cargo run --release -p device-hub        # 普段使いは release (起動・描
 DEVHUB_DEMO=1 cargo run -p device-hub    # 常にデモ
 DEVHUB_FAST=1 cargo run -p device-hub    # GPU ガラス無効
 cargo run -p devhub-hid --example enum   # HID 列挙
+cargo run -p devhub-hid --example lgprobe  # Logitech HID++ の機能・オンボードメモリ (読み取りのみ)
+cargo run -p devhub-hid --example mgprobe  # MonsGeek RY5088 の版・設定 (読み取りのみ)
 cargo run -p devhub-obs --example preview # OBS 無しでオーバーレイ描画を PNG 確認
 cargo clippy --workspace
 ```
@@ -99,4 +106,4 @@ Linux でも `cargo check` は通る (gpui-pre-wgpu は vendor の backdrop を�
 - `Window::paint_backdrop` は `device-hub/src/glass.rs` 経由でだけ呼ぶ。
 - `vendor/` のパッチは上流 (crates.io `gpui-pre`/`gpui-pre-windows` 0.3.11) への最小差分に留める。
   改変箇所には `DEVHUB` のコメントを付ける (`vendor/README.md` 参照)。
-- Web 版のタブを開いたまま実機を操作しない (HID を取り合う)。
+- Web 版のタブを開いたまま実機を操作しない (HID を取り合う)。G HUB / MonsGeek 公式アプリも同様に終了しておく。
