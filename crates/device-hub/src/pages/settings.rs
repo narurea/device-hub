@@ -303,6 +303,82 @@ impl Shell {
                 )),
         );
 
+        let cur = env!("CARGO_PKG_VERSION");
+        let busy = self.app_update_busy;
+        let upd = self.app_update.clone();
+        let mut update_body = ui::body()
+            .pb(px(12.))
+            .child(ui::row_first(
+                "現在のバージョン",
+                Some(match &upd {
+                    Some(u) if u.newer => "新しいバージョンがあります",
+                    Some(_) => "最新版です",
+                    None => "GitHub (narurea/device-hub) の公開版と比べます",
+                }),
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(10.))
+                    .child(ui::sub(format!("v{cur}")))
+                    .child(ui::button(
+                        "app-update-now",
+                        if busy { "確認中…" } else { "更新を確認" },
+                        Some("refresh-cw"),
+                        Btn::Glass,
+                        cx,
+                        |this, _, cx| {
+                            this.check_app_update(true, cx);
+                            cx.notify();
+                        },
+                    )),
+            ));
+        if let Some(u) = upd.as_ref().filter(|u| u.newer) {
+            let url = u.url.clone();
+            let help = u
+                .notes
+                .as_deref()
+                .and_then(|n| n.lines().find(|l| !l.trim().is_empty()))
+                .map(str::to_string)
+                .unwrap_or_else(|| {
+                    if u.from_release {
+                        "Release ページからダウンロードできます".into()
+                    } else {
+                        "main ブランチが更新されています (ソースからビルド)".into()
+                    }
+                });
+            update_body = update_body.child(ui::row(
+                &format!("新しいバージョン v{}", u.latest),
+                Some(&help),
+                ui::button(
+                    "app-update-open",
+                    if u.from_release {
+                        "ダウンロードページを開く"
+                    } else {
+                        "変更履歴を開く"
+                    },
+                    Some("download"),
+                    Btn::Primary,
+                    cx,
+                    move |_this, _, cx| cx.open_url(&url),
+                ),
+            ));
+        }
+        update_body = update_body.child(ui::row(
+            "自動で確認する",
+            Some("起動時と、常駐中は 24 時間ごとに確認します (新しい版は通知でお知らせ・自動では入れ替えません)"),
+            ui::toggle(
+                "app-update-auto",
+                self.prefs.app_update_check,
+                cx,
+                |this, on, cx| {
+                    this.prefs.app_update_check = on;
+                    this.prefs.save();
+                    cx.notify();
+                },
+            ),
+        ));
+        let app_update = ui::card_titled("アプリの更新", "download", None).child(update_body);
+
         let about = ui::card_titled("このアプリについて", "info", None).child(
             ui::body()
                 .pb(px(14.))
@@ -331,6 +407,7 @@ impl Shell {
                         backend.into_any_element(),
                         fw.into_any_element(),
                         resident.into_any_element(),
+                        app_update.into_any_element(),
                         about.into_any_element(),
                     ])),
             )

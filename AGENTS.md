@@ -3,6 +3,10 @@
 ブラウザ (www.mouse.fit / hub.xsyd.top) や公式アプリ (Logitech G HUB / MonsGeek) を使わずに
 マウス・キーボードを設定する、Windows 用の個人 GPUI アプリ。デザインは Liquid Glass。
 既定で常駐する (スタートアップ登録 + タスクトレイ、× で閉じても裏で動く — `device-hub/src/resident.rs`)。
+アプリ本体の更新確認あり (`device-hub/src/appupdate.rs` → `devhub-update/src/app.rs`)。確認先は GitHub の
+`narurea/device-hub`: Release があればその最新タグ、無ければ `main` の `crates/device-hub/Cargo.toml` の version。
+**新しい版を配るときは `crates/device-hub/Cargo.toml` の version を上げて main に push する
+(配布物を付けるなら同じ版で `vX.Y.Z` の GitHub Release を作る)**。自己更新はせず、ページを開くだけ。
 
 ## 構成
 

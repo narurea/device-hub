@@ -1,4 +1,5 @@
 //! ファームウェア更新通知 (読み取り専用 — 書き込み/DFU は行わない)。
+//! アプリ本体の更新確認は `app` (GitHub Releases / ブランチの版)。
 //!
 //! - mouse.fit: `Config/<ui_folder>/FWLINK.txt` → zip の ETag/Last-Modified/Length が指紋
 //! - Sparklink: `getKeyboardFirmware` (board_id/vid/pid + Xs-API-Key) → バージョン比較
@@ -7,6 +8,10 @@
 //! 返すだけ — アプリ側は失敗を無視してよい。
 
 use devhub_core::model::FirmwareFeed;
+
+/// Device HUB 本体の更新確認 (GitHub)。
+pub mod app;
+pub use app::{check_app, AppUpdate};
 use std::time::Duration;
 
 const TIMEOUT: Duration = Duration::from_secs(5);

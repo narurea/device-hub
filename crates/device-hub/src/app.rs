@@ -387,6 +387,10 @@ pub struct Shell {
     pub proc_retry: std::collections::HashMap<String, std::time::Instant>,
     /// 自動化ページのフォーム選択状態。
     pub auto_form: crate::pages::auto::AutoForm,
+    /// アプリ本体の更新確認の結果 (未確認なら None)。
+    pub app_update: Option<devhub_update::AppUpdate>,
+    /// 更新確認の通信中。
+    pub app_update_busy: bool,
 
     toast_timer: bool,
     /// 自窓の HWND — 最小化/背面中にワーキングセットを OS へ返すために使う。
@@ -481,12 +485,16 @@ impl Shell {
                     .await;
                 ticks += 1;
                 let alive = this
-                    .update(cx, |this, _cx| {
+                    .update(cx, |this, cx| {
                         this.hub.scan();
                         if ticks.is_multiple_of(15) {
                             this.hub.poll_battery();
                         }
                         this.mem_tick();
+                        // アプリ本体の更新確認 (起動 ~6 秒後と以後 24 時間ごと。間引きは中で)。
+                        if ticks >= 3 {
+                            this.check_app_update(false, cx);
+                        }
                     })
                     .is_ok();
                 if !alive {
@@ -691,6 +699,8 @@ impl Shell {
             proc_pending: vec![],
             proc_retry: Default::default(),
             auto_form: Default::default(),
+            app_update: None,
+            app_update_busy: false,
             toast_timer: false,
             #[cfg(windows)]
             hwnd: window_hwnd(window),

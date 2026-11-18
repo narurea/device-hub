@@ -42,6 +42,12 @@ pub struct Prefs {
     pub close_to_tray: bool,
     /// 初回起動でスタートアップ登録を済ませたか (以降はユーザーの選択を尊重する)。
     pub autostart_initialized: bool,
+    /// アプリ本体の更新を自動で確認する (起動時と 24 時間ごと。既定 ON)。
+    pub app_update_check: bool,
+    /// 最後に自動確認した時刻 (UNIX 秒)。
+    pub app_update_last: u64,
+    /// Windows 通知を出し済みのバージョン (同じ版で毎日通知しない)。
+    pub app_update_notified: String,
 }
 
 /// 設定プロファイル — 録画した `Change` を順に再生して適用する。
@@ -146,6 +152,9 @@ impl Default for Prefs {
             proc_rules: vec![],
             close_to_tray: true,
             autostart_initialized: false,
+            app_update_check: true,
+            app_update_last: 0,
+            app_update_notified: String::new(),
         }
     }
 }

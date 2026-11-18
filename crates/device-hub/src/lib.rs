@@ -11,6 +11,7 @@
 //! - `theme` / `wallpaper` / `prefs` / `keycode`
 
 pub mod app;
+pub mod appupdate;
 pub mod audio;
 pub mod cursor;
 pub mod fwstate;
