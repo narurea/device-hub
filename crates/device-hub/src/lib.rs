@@ -7,9 +7,11 @@
 //! - `glass` … Liquid Glass の面 (GPU backdrop-filter)
 //! - `motion` … ばねアニメーション・要素位置の記録
 //! - `store` … バックエンド (devhub-core 契約) との橋。デバイスごとのワーカースレッド
+//! - `resident` … 常駐 (スタートアップ登録・タスクトレイ・閉じても終了しない)
 //! - `theme` / `wallpaper` / `prefs` / `keycode`
 
 pub mod app;
+pub mod appupdate;
 pub mod audio;
 pub mod cursor;
 pub mod fwstate;
@@ -23,6 +25,7 @@ pub mod palette;
 pub mod prefs;
 pub mod presets;
 pub mod procmon;
+pub mod resident;
 pub use devhub_obs::rawinput;
 pub mod store;
 pub mod theme;

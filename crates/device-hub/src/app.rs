@@ -387,6 +387,10 @@ pub struct Shell {
     pub proc_retry: std::collections::HashMap<String, std::time::Instant>,
     /// 自動化ページのフォーム選択状態。
     pub auto_form: crate::pages::auto::AutoForm,
+    /// アプリ本体の更新確認の結果 (未確認なら None)。
+    pub app_update: Option<devhub_update::AppUpdate>,
+    /// 更新確認の通信中。
+    pub app_update_busy: bool,
 
     toast_timer: bool,
     /// 自窓の HWND — 最小化/背面中にワーキングセットを OS へ返すために使う。
@@ -481,12 +485,16 @@ impl Shell {
                     .await;
                 ticks += 1;
                 let alive = this
-                    .update(cx, |this, _cx| {
+                    .update(cx, |this, cx| {
                         this.hub.scan();
                         if ticks.is_multiple_of(15) {
                             this.hub.poll_battery();
                         }
                         this.mem_tick();
+                        // アプリ本体の更新確認 (起動 ~6 秒後と以後 24 時間ごと。間引きは中で)。
+                        if ticks >= 3 {
+                            this.check_app_update(false, cx);
+                        }
                     })
                     .is_ok();
                 if !alive {
@@ -593,6 +601,49 @@ impl Shell {
         let focus = cx.focus_handle();
         window.focus(&focus, cx);
 
+        // 常駐: × は窓を隠すだけ (タスクトレイから戻す)。トレイが無いときは普通に閉じる。
+        window.on_window_should_close(cx, |window, _cx| {
+            if crate::resident::should_hide_on_close() {
+                #[cfg(windows)]
+                crate::resident::hide_window(window_hwnd(window));
+                #[cfg(not(windows))]
+                let _ = window;
+                false
+            } else {
+                true
+            }
+        });
+        // トレイからの依頼 (開く / 終了) を拾う。トレイスレッドは GPUI に触れないので
+        // アトミック経由で受け取り、ここで窓を前面へ出す/アプリを終える。
+        cx.spawn_in(
+            window,
+            async move |this: WeakEntity<Shell>, cx: &mut AsyncWindowContext| loop {
+                cx.background_executor()
+                    .timer(Duration::from_millis(150))
+                    .await;
+                let req = crate::resident::take_request();
+                let alive = this
+                    .update_in(cx, |_this, window, cx| match req {
+                        Some(crate::resident::Request::Show) => {
+                            #[cfg(windows)]
+                            crate::resident::show_window(_this.hwnd);
+                            window.activate_window();
+                            cx.notify();
+                        }
+                        Some(crate::resident::Request::Quit) => {
+                            crate::resident::remove_tray();
+                            cx.quit();
+                        }
+                        None => {}
+                    })
+                    .is_ok();
+                if !alive {
+                    break;
+                }
+            },
+        )
+        .detach();
+
         let route = Route::Home;
         Self {
             hub,
@@ -648,6 +699,8 @@ impl Shell {
             proc_pending: vec![],
             proc_retry: Default::default(),
             auto_form: Default::default(),
+            app_update: None,
+            app_update_busy: false,
             toast_timer: false,
             #[cfg(windows)]
             hwnd: window_hwnd(window),
@@ -1992,7 +2045,9 @@ impl Shell {
         if self.hwnd == 0 {
             return;
         }
-        let iconic = unsafe { IsIconic(HWND(self.hwnd as _)).as_bool() };
+        // トレイに隠している間も最小化と同じ扱い (描画は止まり、メモリは OS へ返す)。
+        let iconic = unsafe { IsIconic(HWND(self.hwnd as _)).as_bool() }
+            || crate::resident::window_hidden(self.hwnd);
         let inactive = iconic || !self.last_window_active;
         unsafe {
             let trim = || {

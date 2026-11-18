@@ -265,6 +265,171 @@ pub const KNOWN: &[KnownDevice] = &[
         driver: DriverKind::Lamzu,
         verified: false,
     },
+    // ---------------------------------------------------------------- マウス (Logitech HID++ 2.0)
+    // G HUB 置換。設定は HID++ long report (0x11, 20B) の vendor コレクション FF00/0002。
+    // PID は libratbag のデバイス定義 (usb:046d:c09b / 無線 wpid 40a9) と
+    // Linux hid-logitech-dj のパッチ (SL2 受信機 0xc54d) から — **実機未確認**。
+    // 機能は HID++ の feature 問い合わせで決まるので、caps は開いた後に組み立てる。
+    lg(
+        0xC09B,
+        "pro-x-superlight-2",
+        "PRO X SUPERLIGHT 2",
+        Transport::Wired,
+    ),
+    // SL2 同梱の Lightspeed 受信機 (device index 1 にマウス)。
+    lg(
+        0xC54D,
+        "lightspeed-c54d",
+        "PRO X SUPERLIGHT 2",
+        Transport::Wireless24G,
+    ),
+    // 汎用 Lightspeed 受信機 (G502 X / PRO X SUPERLIGHT 等)。中身の名前は
+    // feature 0x0005 (DeviceName) で取り直す。
+    lg(
+        0xC547,
+        "lightspeed-c547",
+        "Logitech LIGHTSPEED",
+        Transport::Wireless24G,
+    ),
+    // ---------------------------------------------------------------- キーボード (MonsGeek RY5088)
+    // FUN60 Ultra は同じ PID を複数機種と共有している (公式デバイス DB の id
+    // 2307/2352/2381/2387 が FUN60 Ultra)。PID 一致で開き、GET_USB_VERSION (0x8F)
+    // の device id で機種名を確定する。config IF = 2 (usage FFFF:02, 64B feature)。
+    mg(0x5029, "ry5088-5029"),
+    mg(0x502D, "ry5088-502d"),
+    mg(0x5030, "ry5088-5030"),
+];
+
+const fn lg(
+    pid: u16,
+    model: &'static str,
+    name: &'static str,
+    transport: Transport,
+) -> KnownDevice {
+    KnownDevice {
+        vid: 0x046D,
+        pid,
+        usage_page: Some(0xFF00),
+        usage: Some(0x02),
+        kind: DeviceKind::Mouse,
+        vendor: "Logitech",
+        model,
+        name,
+        transport,
+        driver: DriverKind::Logitech,
+        verified: false,
+    }
+}
+
+const fn mg(pid: u16, model: &'static str) -> KnownDevice {
+    KnownDevice {
+        vid: 0x3151,
+        pid,
+        usage_page: Some(0xFFFF),
+        usage: Some(0x02),
+        kind: DeviceKind::Keyboard,
+        vendor: "MonsGeek",
+        model,
+        name: "MonsGeek FUN60 Ultra",
+        transport: Transport::Wired,
+        driver: DriverKind::Monsgeek,
+        verified: false,
+    }
+}
+
+/// FUN60 Ultra (公式 key layout `Common61_gk06`) の物理配置。
+///
+/// `id` = RY5088 のマトリクス位置 (0..128、列優先で 1 列 6 スロット:
+/// `pos = col * 6 + row`)。per-key のトラベル・キーマップはこの位置で指定する。
+/// 位置表は公式デバイス DB の既定キーマトリクス (layout fallback) から —
+/// **実機で要確認** (Fn キーはマトリクスに出ないので含めない)。
+pub fn fun60_layout() -> Vec<LayoutKey> {
+    fn k(pos: u16, x: f32, y: f32, w: f32, label: &str) -> LayoutKey {
+        LayoutKey {
+            id: pos,
+            x,
+            y,
+            w,
+            h: 1.0,
+            label: label.into(),
+        }
+    }
+    vec![
+        // Row 0
+        k(1, 0.0, 0.0, 1.0, "Esc"),
+        k(7, 1.0, 0.0, 1.0, "1"),
+        k(13, 2.0, 0.0, 1.0, "2"),
+        k(19, 3.0, 0.0, 1.0, "3"),
+        k(25, 4.0, 0.0, 1.0, "4"),
+        k(31, 5.0, 0.0, 1.0, "5"),
+        k(37, 6.0, 0.0, 1.0, "6"),
+        k(43, 7.0, 0.0, 1.0, "7"),
+        k(49, 8.0, 0.0, 1.0, "8"),
+        k(55, 9.0, 0.0, 1.0, "9"),
+        k(61, 10.0, 0.0, 1.0, "0"),
+        k(67, 11.0, 0.0, 1.0, "-"),
+        k(73, 12.0, 0.0, 1.0, "="),
+        k(79, 13.0, 0.0, 2.0, "Backspace"),
+        // Row 1
+        k(2, 0.0, 1.0, 1.5, "Tab"),
+        k(8, 1.5, 1.0, 1.0, "Q"),
+        k(14, 2.5, 1.0, 1.0, "W"),
+        k(20, 3.5, 1.0, 1.0, "E"),
+        k(26, 4.5, 1.0, 1.0, "R"),
+        k(32, 5.5, 1.0, 1.0, "T"),
+        k(38, 6.5, 1.0, 1.0, "Y"),
+        k(44, 7.5, 1.0, 1.0, "U"),
+        k(50, 8.5, 1.0, 1.0, "I"),
+        k(56, 9.5, 1.0, 1.0, "O"),
+        k(62, 10.5, 1.0, 1.0, "P"),
+        k(68, 11.5, 1.0, 1.0, "["),
+        k(74, 12.5, 1.0, 1.0, "]"),
+        k(80, 13.5, 1.0, 1.5, "\\"),
+        // Row 2
+        k(3, 0.0, 2.0, 1.75, "Caps"),
+        k(9, 1.75, 2.0, 1.0, "A"),
+        k(15, 2.75, 2.0, 1.0, "S"),
+        k(21, 3.75, 2.0, 1.0, "D"),
+        k(27, 4.75, 2.0, 1.0, "F"),
+        k(33, 5.75, 2.0, 1.0, "G"),
+        k(39, 6.75, 2.0, 1.0, "H"),
+        k(45, 7.75, 2.0, 1.0, "J"),
+        k(51, 8.75, 2.0, 1.0, "K"),
+        k(57, 9.75, 2.0, 1.0, "L"),
+        k(63, 10.75, 2.0, 1.0, ";"),
+        k(69, 11.75, 2.0, 1.0, "'"),
+        k(81, 12.75, 2.0, 2.25, "Enter"),
+        // Row 3
+        k(4, 0.0, 3.0, 2.25, "LShift"),
+        k(16, 2.25, 3.0, 1.0, "Z"),
+        k(22, 3.25, 3.0, 1.0, "X"),
+        k(28, 4.25, 3.0, 1.0, "C"),
+        k(34, 5.25, 3.0, 1.0, "V"),
+        k(40, 6.25, 3.0, 1.0, "B"),
+        k(46, 7.25, 3.0, 1.0, "N"),
+        k(52, 8.25, 3.0, 1.0, "M"),
+        k(58, 9.25, 3.0, 1.0, ","),
+        k(64, 10.25, 3.0, 1.0, "."),
+        k(70, 11.25, 3.0, 1.0, "/"),
+        k(76, 12.25, 3.0, 2.75, "RShift"),
+        // Row 4 (Fn はマトリクス外)
+        k(5, 0.0, 4.0, 1.25, "LCtrl"),
+        k(17, 1.25, 4.0, 1.25, "LWin"),
+        k(23, 2.5, 4.0, 1.25, "LAlt"),
+        k(41, 3.75, 4.0, 6.25, "Space"),
+        k(65, 10.0, 4.0, 1.25, "RAlt"),
+        k(77, 11.25, 4.0, 1.25, "Menu"),
+        k(83, 12.5, 4.0, 1.25, "RCtrl"),
+    ]
+}
+
+/// FUN60 Ultra の既定キーマトリクス (位置 → HID usage)。layer 0 の
+/// 「既定に戻す」と、位置表の自己検査 (テスト) に使う。
+pub const FUN60_DEFAULT_MATRIX: [u8; 84] = [
+    0, 41, 43, 57, 225, 224, 0, 30, 20, 4, 0, 0, 0, 31, 26, 22, 29, 227, 0, 32, 8, 7, 27, 226, 0,
+    33, 21, 9, 6, 0, 0, 34, 23, 10, 25, 0, 0, 35, 28, 11, 5, 44, 0, 36, 24, 13, 17, 0, 0, 37, 12,
+    14, 16, 0, 0, 38, 18, 15, 54, 0, 0, 39, 19, 51, 55, 230, 0, 45, 47, 52, 56, 0, 0, 46, 48, 0,
+    229, 101, 0, 42, 49, 40, 0, 228,
 ];
 
 /// 列挙結果 (VID/PID/usage) に合う既知デバイス。`0xFFFF` のプレースホルダは一致しない。
