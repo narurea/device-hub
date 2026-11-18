@@ -4,6 +4,8 @@ on:
   push:
     branches: [main]
   pull_request:
+  # Actions 画面の「Run workflow」ボタンから手動でビルド (配布用 exe を作り直す)。
+  workflow_dispatch:
 
 # 同じブランチへの連続 push では古い run を自動キャンセル。
 concurrency:
