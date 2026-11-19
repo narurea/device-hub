@@ -56,6 +56,8 @@ pub mod feat {
     pub const BATTERY_STATUS: u16 = 0x1000;
     pub const UNIFIED_BATTERY: u16 = 0x1004;
     pub const ADJUSTABLE_DPI: u16 = 0x2201;
+    /// SL2 など新しいゲーミングマウスの DPI (X/Y・LOD・本体プロファイルの DPI 段)。
+    pub const EXT_DPI: u16 = 0x2202;
     pub const REPORT_RATE: u16 = 0x8060;
     pub const EXT_REPORT_RATE: u16 = 0x8061;
     pub const ONBOARD_PROFILES: u16 = 0x8100;
@@ -473,6 +475,139 @@ fn hidpp_err(code: u8) -> &'static str {
     }
 }
 
+// ==================================================================== 0x2202 / 0x8061 の純関数
+
+/// 0x2202 getSensorDpiRanges の連結ストリーム (各ページの 3 バイト目以降) →
+/// (min, max, step)。値は BE16、`0xE000 | step` は前後の値の間を step 刻みで埋める印。
+pub fn parse_dpi_ranges(stream: &[u8]) -> Option<(u32, u32, u32)> {
+    let mut vals = vec![];
+    let mut step: Option<u32> = None;
+    for c in stream.chunks(2) {
+        if c.len() < 2 {
+            break;
+        }
+        let v = u16::from_be_bytes([c[0], c[1]]);
+        if v == 0 {
+            break;
+        }
+        if v >> 13 == 0b111 {
+            let s = (v & 0x1FFF) as u32;
+            step = Some(step.map_or(s, |x| x.min(s)));
+        } else {
+            vals.push(v as u32);
+        }
+    }
+    let min = *vals.iter().min()?;
+    let max = *vals.iter().max()?;
+    Some((min, max, step.unwrap_or(50).max(1)))
+}
+
+/// 0x2202 getSensorDpiList (`[sensor, dir, BE16…, 0]`) → 本体プロファイルの DPI 段。
+pub fn parse_dpi_levels(p: &[u8]) -> Vec<u32> {
+    p.get(2..)
+        .unwrap_or(&[])
+        .chunks(2)
+        .take_while(|c| c.len() == 2 && (c[0] != 0 || c[1] != 0))
+        .map(|c| u16::from_be_bytes([c[0], c[1]]) as u32)
+        .filter(|&d| d >> 13 != 0b111)
+        .collect()
+}
+
+/// 0x8061 fn0/fn1 の応答 → 使えるレート (Hz)。マスクは **byte 1 だけ** (Options+ と同じ)。
+pub fn ext_rate_mask(p: &[u8]) -> Vec<i64> {
+    let m = p.get(1).copied().unwrap_or(0);
+    (0..7)
+        .filter(|i| m & (1 << i) != 0)
+        .map(|i| EXT_RATES[i])
+        .collect()
+}
+
+/// 既定のボタン割り当て (ホストモード・プロファイル未対応時の表示用)。
+fn default_buttons(n: usize) -> Vec<ButtonAction> {
+    let d = [
+        MouseFn::Left,
+        MouseFn::Right,
+        MouseFn::Middle,
+        MouseFn::Back,
+        MouseFn::Forward,
+    ];
+    (0..n)
+        .map(|i| {
+            d.get(i)
+                .map_or(ButtonAction::Disabled, |f| ButtonAction::Mouse(*f))
+        })
+        .collect()
+}
+
+// ==================================================================== ホストモードの保存
+
+/// ホストモードの設定 (本体は電源断でオンボードに戻るので、アプリが覚えて再適用する)。
+/// `%APPDATA%\DeviceHub\logitech.json` に DeviceId ごと。
+#[derive(Clone, Debug, Default, PartialEq)]
+struct HostPrefs {
+    host: bool,
+    stages: Vec<u32>,
+    active: usize,
+    rate: Option<i64>,
+}
+
+fn host_file() -> Option<std::path::PathBuf> {
+    let base = std::env::var_os("APPDATA")
+        .map(std::path::PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".config"))
+        })?;
+    Some(base.join("DeviceHub").join("logitech.json"))
+}
+
+fn load_host(id: &str) -> HostPrefs {
+    let Some(v) = host_file()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+    else {
+        return HostPrefs::default();
+    };
+    let e = &v[id];
+    HostPrefs {
+        host: e["host"].as_bool().unwrap_or(false),
+        stages: e["stages"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(|x| x.as_u64())
+                    .map(|x| x as u32)
+                    .collect()
+            })
+            .unwrap_or_default(),
+        active: e["active"].as_u64().unwrap_or(0) as usize,
+        rate: e["rate"].as_i64(),
+    }
+}
+
+fn save_host(id: &str, h: &HostPrefs) {
+    let Some(p) = host_file() else { return };
+    let mut v = std::fs::read_to_string(&p)
+        .ok()
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+        .filter(|v| v.is_object())
+        .unwrap_or_else(|| serde_json::json!({}));
+    v[id] = serde_json::json!({
+        "host": h.host,
+        "stages": h.stages,
+        "active": h.active,
+        "rate": h.rate,
+    });
+    if let Some(dir) = p.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    if let Ok(s) = serde_json::to_string_pretty(&v) {
+        let tmp = p.with_extension("json.tmp");
+        if std::fs::write(&tmp, s).is_ok() {
+            let _ = std::fs::rename(&tmp, &p);
+        }
+    }
+}
+
 // ==================================================================== ドライバ
 
 /// オンボードメモリの状態 (開いた後にキャッシュ)。
@@ -485,6 +620,13 @@ struct Onboard {
     dir_is_rom: bool,
 }
 
+/// 0x2202 のセンサー能力。
+#[derive(Clone, Copy, Debug, Default)]
+struct Dpi2202 {
+    y: bool,
+    lod: bool,
+}
+
 pub struct LogitechDriver {
     dev: Mutex<hidapi::HidDevice>,
     info: Mutex<DeviceInfo>,
@@ -494,6 +636,8 @@ pub struct LogitechDriver {
     /// feature id → index (None = 持たない)。
     features: Mutex<HashMap<u16, Option<u8>>>,
     onboard: Mutex<Option<Onboard>>,
+    /// オンボードプロファイルを扱えない理由 (診断表示用)。
+    onboard_err: Mutex<Option<String>>,
     caps: Mutex<Option<Capabilities>>,
 }
 
@@ -511,6 +655,7 @@ pub fn open(
         index: Mutex::new(if wired { 0xFF } else { 1 }),
         features: Mutex::new(HashMap::new()),
         onboard: Mutex::new(None),
+        onboard_err: Mutex::new(None),
         caps: Mutex::new(None),
     };
     if !wired {
@@ -531,6 +676,10 @@ impl LogitechDriver {
         }
     }
 
+    fn id(&self) -> String {
+        lock(&self.info).id.0.clone()
+    }
+
     fn set_asleep(&self, asleep: bool) {
         let mut i = lock(&self.info);
         if i.transport == Transport::Wired || i.asleep == asleep {
@@ -542,7 +691,7 @@ impl LogitechDriver {
         drop(i);
         self.emit(HubEvent::Info(id.clone(), Box::new(info)));
         if !asleep {
-            // 起きた: 名前・機能を取り直し、UI に読み直させる。
+            // 起きた: 名前・機能を取り直し、ホストモード設定を再適用して読み直させる。
             self.wake_setup();
             self.emit(HubEvent::StateChanged(id));
         }
@@ -595,7 +744,9 @@ impl LogitechDriver {
                 if buf[2] == fidx && buf[3] == f[3] {
                     drop(dev);
                     self.set_asleep(false);
-                    return Ok(buf[4..n.min(LONG_LEN)].to_vec());
+                    let mut out = buf[4..n.min(LONG_LEN)].to_vec();
+                    out.resize(16, 0);
+                    return Ok(out);
                 }
             }
         }
@@ -610,6 +761,10 @@ impl LogitechDriver {
         self.request_ex(fidx, func, params, 700, true)
     }
 
+    fn write_req(&self, fidx: u8, func: u8, params: &[u8]) -> HubResult<Vec<u8>> {
+        self.request_ex(fidx, func, params, 1000, false)
+    }
+
     /// 受信機経由: 1..6 を ping してマウスの device index を探す。
     fn find_index(&self) {
         for idx in 1..=6u8 {
@@ -622,6 +777,15 @@ impl LogitechDriver {
             }
         }
         *lock(&self.index) = 1;
+    }
+
+    /// 0x8061 の接続種別 (0 = 有線, 1 = ゲーミング無線)。device index で決まる。
+    fn conn_type(&self) -> u8 {
+        if *lock(&self.index) == 0xFF {
+            0
+        } else {
+            1
+        }
     }
 
     /// feature id → index (キャッシュ)。通信できなければ Err (キャッシュしない)。
@@ -639,11 +803,16 @@ impl LogitechDriver {
         Ok(v)
     }
 
+    fn has(&self, id: u16) -> bool {
+        matches!(self.feature(id), Ok(Some(_)))
+    }
+
     fn need(&self, id: u16, what: &'static str) -> HubResult<u8> {
         self.feature(id)?.ok_or(HubError::Unsupported(what))
     }
 
-    /// 起動/覚醒時: 名前・オンボード情報を取り、オンボードモードにする。
+    /// 起動/覚醒時: 名前を取り、ユーザーがホストモードを選んでいれば再適用する。
+    /// (G HUB と違い、本体のモードを勝手には変えない。)
     fn wake_setup(&self) {
         if lock(&self.info).asleep {
             return;
@@ -657,15 +826,11 @@ impl LogitechDriver {
                 self.emit(HubEvent::Info(info.id.clone(), Box::new(info)));
             }
         }
-        if let Ok(Some(fi)) = self.feature(feat::ONBOARD_PROFILES) {
-            // G HUB が残したホストモードのままだとオンボード設定が効かない。
-            if let Ok(r) = self.request(fi, ob::GET_MODE, &[]) {
-                if r.first() != Some(&ob::MODE_ONBOARD) {
-                    let _ = self.request_ex(fi, ob::SET_MODE, &[ob::MODE_ONBOARD], 700, false);
-                }
-            }
-            let _ = self.load_onboard();
+        let h = load_host(&self.id());
+        if h.host && self.has(feat::ONBOARD_PROFILES) {
+            let _ = self.apply_host(&h);
         }
+        let _ = self.load_onboard();
     }
 
     fn read_name(&self) -> HubResult<String> {
@@ -674,7 +839,7 @@ impl LogitechDriver {
         let mut s = Vec::new();
         while s.len() < len.min(64) {
             let r = self.request(fi, 1, &[s.len() as u8])?;
-            if r.is_empty() {
+            if r.iter().all(|&b| b == 0) {
                 break;
             }
             s.extend(r.iter().take(len - s.len()));
@@ -695,6 +860,162 @@ impl LogitechDriver {
             }
         }
         None
+    }
+
+    // ---------------------------------------------------------------- モード
+
+    /// 本体がオンボードモードか (0x8100 が無ければ false = 常にホスト扱い)。
+    fn is_onboard_mode(&self) -> bool {
+        let Ok(Some(fi)) = self.feature(feat::ONBOARD_PROFILES) else {
+            return false;
+        };
+        self.request(fi, ob::GET_MODE, &[])
+            .map(|r| r[0] == ob::MODE_ONBOARD)
+            .unwrap_or(true)
+    }
+
+    fn set_mode(&self, onboard: bool) -> HubResult<()> {
+        let fi = self.ob_index()?;
+        self.write_req(fi, ob::SET_MODE, &[if onboard { 1 } else { 2 }])
+            .map(|_| ())
+    }
+
+    /// ホストモードへ切り替えて、覚えている DPI とレートを適用する。
+    fn apply_host(&self, h: &HostPrefs) -> HubResult<()> {
+        self.set_mode(false)?;
+        if let Some(&d) = h.stages.get(h.active.min(h.stages.len().saturating_sub(1))) {
+            self.write_dpi(d)?;
+        }
+        if let Some(r) = h.rate {
+            let _ = self.write_ext_rate(r);
+        }
+        Ok(())
+    }
+
+    /// プロファイルを編集できる状態か (オンボードモードで形式も対応)。
+    fn profile_editable(&self) -> bool {
+        self.is_onboard_mode()
+            && self.load_onboard().is_ok_and(|o| {
+                let i = self.active_profile(&o);
+                self.read_profile(&o, i)
+                    .is_ok_and(|p| self.check_profile(&p).is_ok())
+            })
+    }
+
+    // ---------------------------------------------------------------- DPI (0x2202 / 0x2201)
+
+    fn dpi2202(&self) -> Option<(u8, Dpi2202)> {
+        let fi = self.feature(feat::EXT_DPI).ok()??;
+        let r = self.request(fi, 1, &[0]).ok()?;
+        Some((
+            fi,
+            Dpi2202 {
+                y: r[2] & 0x01 != 0,
+                lod: r[2] & 0x02 != 0,
+            },
+        ))
+    }
+
+    /// (min, max, step)。
+    fn dpi_range(&self) -> (u32, u32, u32) {
+        if let Ok(Some(fi)) = self.feature(feat::EXT_DPI) {
+            let mut stream = vec![];
+            for page in 0..16u8 {
+                let Ok(r) = self.request(fi, 2, &[0, 0, page]) else {
+                    break;
+                };
+                if r[2] != page {
+                    break;
+                }
+                stream.extend_from_slice(&r[3..16]);
+                if stream
+                    .chunks(2)
+                    .any(|c| c.len() == 2 && c[0] == 0 && c[1] == 0)
+                {
+                    break;
+                }
+            }
+            if let Some(v) = parse_dpi_ranges(&stream) {
+                return v;
+            }
+        }
+        if let Ok(Some(fi)) = self.feature(feat::ADJUSTABLE_DPI) {
+            if let Some(v) = self
+                .request(fi, 1, &[0])
+                .ok()
+                .and_then(|r| parse_dpi_list(&r))
+            {
+                return v;
+            }
+        }
+        (100, 32000, 50)
+    }
+
+    /// 今の DPI と (0x2202 なら) LOD。
+    fn read_dpi(&self) -> HubResult<(u32, Option<u8>)> {
+        if let Some((fi, c)) = self.dpi2202() {
+            let r = self.request(fi, 5, &[0])?;
+            let x = u16::from_be_bytes([r[1], r[2]]) as u32;
+            return Ok((x, c.lod.then_some(r[9])));
+        }
+        let fi = self.need(feat::ADJUSTABLE_DPI, "dpi")?;
+        let r = self.request(fi, 2, &[0])?;
+        Ok((u16::from_be_bytes([r[1], r[2]]) as u32, None))
+    }
+
+    fn write_dpi_lod(&self, dpi: u32, lod: Option<u8>) -> HubResult<()> {
+        let d = (dpi.clamp(1, 0xFFFF) as u16).to_be_bytes();
+        if let Some((fi, c)) = self.dpi2202() {
+            let cur_lod = if c.lod {
+                lod.or_else(|| self.read_dpi().ok().and_then(|x| x.1))
+                    .unwrap_or(2)
+            } else {
+                0
+            };
+            let y = if c.y { d } else { [0, 0] };
+            return self
+                .write_req(fi, 6, &[0, d[0], d[1], y[0], y[1], cur_lod])
+                .map(|_| ());
+        }
+        let fi = self.need(feat::ADJUSTABLE_DPI, "dpi")?;
+        self.write_req(fi, 3, &[0, d[0], d[1]]).map(|_| ())
+    }
+
+    fn write_dpi(&self, dpi: u32) -> HubResult<()> {
+        self.write_dpi_lod(dpi, None)
+    }
+
+    /// オンボードモードで本体プロファイルの DPI 段 (0x2202 fn3)。
+    fn onboard_levels(&self) -> Vec<u32> {
+        let Some((fi, _)) = self.dpi2202() else {
+            return vec![];
+        };
+        self.request(fi, 3, &[0, 0])
+            .map(|r| parse_dpi_levels(&r))
+            .unwrap_or_default()
+    }
+
+    /// プロファイルの解釈が本体と合っているかの照合: 0x2202 が返す本体の DPI 段と、
+    /// こちらがセクタから読んだ DPI 段が一致すること。合わなければ形式の解釈違いとみなし
+    /// 表示・書き込みに使わない (壊れたプロファイルを書き戻さないため)。
+    fn check_profile(&self, p: &[u8]) -> HubResult<()> {
+        let levels = self.onboard_levels();
+        if levels.is_empty() {
+            return Ok(());
+        }
+        let mine: Vec<u32> = profile_dpis(p)
+            .iter()
+            .take_while(|&&d| d != 0 && d != 0xFFFF)
+            .map(|&d| d as u32)
+            .collect();
+        if mine == levels {
+            Ok(())
+        } else {
+            let msg =
+                format!("プロファイルの解釈が本体と一致しません (本体 {levels:?} / 解釈 {mine:?})");
+            *lock(&self.onboard_err) = Some(msg.clone());
+            Err(HubError::Protocol(msg))
+        }
     }
 
     // ---------------------------------------------------------------- オンボードメモリ
@@ -725,32 +1046,42 @@ impl LogitechDriver {
         let fi = self.ob_index()?;
         let s = sector.to_be_bytes();
         let l = (data.len() as u16).to_be_bytes();
-        self.request_ex(
-            fi,
-            ob::MEM_ADDR_WRITE,
-            &[s[0], s[1], 0, 0, l[0], l[1]],
-            1000,
-            false,
-        )?;
+        self.write_req(fi, ob::MEM_ADDR_WRITE, &[s[0], s[1], 0, 0, l[0], l[1]])?;
         for c in data.chunks(16) {
             let mut b = [0xFFu8; 16];
             b[..c.len()].copy_from_slice(c);
-            self.request_ex(fi, ob::MEM_WRITE, &b, 1000, false)?;
+            self.write_req(fi, ob::MEM_WRITE, &b)?;
         }
         self.request_ex(fi, ob::MEM_WRITE_END, &[], 1500, false)?;
         Ok(())
     }
 
-    /// 説明・ディレクトリを読んでキャッシュする。
+    /// 説明・ディレクトリを読んでキャッシュする。失敗理由は診断用に残す。
     fn load_onboard(&self) -> HubResult<Onboard> {
         if let Some(o) = lock(&self.onboard).clone() {
             return Ok(o);
         }
+        let r = self.load_onboard_inner();
+        match &r {
+            Ok(o) => {
+                *lock(&self.onboard) = Some(o.clone());
+                *lock(&self.onboard_err) = None;
+            }
+            Err(e) => *lock(&self.onboard_err) = Some(e.to_string()),
+        }
+        r
+    }
+
+    fn load_onboard_inner(&self) -> HubResult<Onboard> {
         let fi = self.ob_index()?;
-        let desc = ObDesc::parse(&self.request(fi, ob::GET_DESC, &[])?)
+        let raw = self.request(fi, ob::GET_DESC, &[])?;
+        let desc = ObDesc::parse(&raw)
             .ok_or_else(|| HubError::Protocol("onboard: short description".into()))?;
         if !desc.supported() {
-            return Err(HubError::Unsupported("この機種のオンボードメモリ形式"));
+            return Err(HubError::Protocol(format!(
+                "未対応のオンボード形式 (memory {}, profile format {}, sector {}B)",
+                desc.memory_model, desc.profile_format, desc.sector_size
+            )));
         }
         let max = desc.profile_count as usize;
         let user = self.read_sector(0, desc.sector_size)?;
@@ -765,28 +1096,23 @@ impl LogitechDriver {
                 (d, true)
             }
         };
-        let o = Onboard {
+        Ok(Onboard {
             desc,
             dir,
             dir_is_rom,
-        };
-        *lock(&self.onboard) = Some(o.clone());
-        Ok(o)
+        })
     }
 
-    /// 現在のプロファイル番号 (0 始まり)。
+    /// 現在のプロファイル番号 (0 始まり)。getCurrentProfile の byte1 = 1 始まりの番号。
     fn active_profile(&self, o: &Onboard) -> usize {
         let Ok(fi) = self.ob_index() else { return 0 };
         let Ok(r) = self.request(fi, ob::GET_PROFILE, &[]) else {
             return 0;
         };
-        let addr = u16::from_be_bytes([
-            r.first().copied().unwrap_or(0),
-            r.get(1).copied().unwrap_or(1),
-        ]);
+        let addr = u16::from_be_bytes([r[0], r[1]]);
         o.dir
             .iter()
-            .position(|(a, _)| *a == addr)
+            .position(|(a, _)| *a == addr || (*a & 0xFF) == addr & 0xFF)
             .unwrap_or_else(|| ((addr & 0xFF) as usize).saturating_sub(1))
             .min(o.dir.len().saturating_sub(1))
     }
@@ -834,9 +1160,14 @@ impl LogitechDriver {
 
     /// アクティブプロファイルを読み → `edit` → 書き戻し → 再選択で反映。
     fn edit_active(&self, edit: impl FnOnce(&mut Vec<u8>) -> HubResult<()>) -> HubResult<()> {
+        // 解釈が本体と合わないなら、ROM → ユーザー領域の初期化も含めて一切書かない。
+        if !self.profile_editable() {
+            return Err(self.not_editable("この設定"));
+        }
         let o = self.ensure_user()?;
         let i = self.active_profile(&o);
         let mut p = self.read_profile(&o, i)?;
+        self.check_profile(&p)?;
         let before = p.clone();
         edit(&mut p)?;
         if p == before {
@@ -854,24 +1185,31 @@ impl LogitechDriver {
 
     fn set_dpi_index(&self, idx: u8) -> HubResult<()> {
         let fi = self.ob_index()?;
-        self.request_ex(fi, ob::SET_DPI_INDEX, &[idx], 700, false)
-            .map(|_| ())
+        self.write_req(fi, ob::SET_DPI_INDEX, &[idx]).map(|_| ())
+    }
+
+    /// プロファイルを書けないときの説明。
+    fn not_editable(&self, what: &str) -> HubError {
+        if !self.is_onboard_mode() {
+            return HubError::Invalid(format!(
+                "{what}はオンボードメモリモードでのみ本体に保存できます (「オンボードメモリを使う」を ON に)"
+            ));
+        }
+        let why = lock(&self.onboard_err)
+            .clone()
+            .unwrap_or_else(|| "読み込みに失敗".into());
+        HubError::Invalid(format!(
+            "この機種のオンボードプロファイルはまだ書き換えられません ({why})。DPI とレートは「オンボードメモリを使う」を OFF (ホストモード) にすると変更できます。「診断情報を保存」の結果を送ってもらえれば対応します"
+        ))
     }
 
     // ---------------------------------------------------------------- レポートレート
 
-    /// 使えるレート (Hz) と方式。
     fn rate_options(&self) -> Vec<i64> {
         if let Ok(Some(fi)) = self.feature(feat::EXT_REPORT_RATE) {
+            // fn1 getActualReportRateList = 今の接続で使えるもの。
             if let Ok(r) = self.request(fi, 1, &[]) {
-                let flags = u16::from_be_bytes([
-                    r.first().copied().unwrap_or(0),
-                    r.get(1).copied().unwrap_or(0),
-                ]);
-                let v: Vec<i64> = (0..7)
-                    .filter(|i| flags & (1 << i) != 0)
-                    .map(|i| EXT_RATES[i])
-                    .collect();
+                let v = ext_rate_mask(&r);
                 if !v.is_empty() {
                     return v;
                 }
@@ -879,7 +1217,7 @@ impl LogitechDriver {
         }
         if let Ok(Some(fi)) = self.feature(feat::REPORT_RATE) {
             if let Ok(r) = self.request(fi, 0, &[]) {
-                let flags = r.first().copied().unwrap_or(0);
+                let flags = r[0];
                 let v: Vec<i64> = [8u8, 4, 2, 1]
                     .iter()
                     .filter(|&&ms| flags & (1 << (ms - 1)) != 0)
@@ -895,15 +1233,15 @@ impl LogitechDriver {
 
     fn read_rate(&self, profile: Option<&[u8]>) -> Option<i64> {
         if let Ok(Some(fi)) = self.feature(feat::EXT_REPORT_RATE) {
-            if let Ok(r) = self.request(fi, 2, &[]) {
-                if let Some(&hz) = r.first().and_then(|&i| EXT_RATES.get(i as usize)) {
+            if let Ok(r) = self.request(fi, 2, &[self.conn_type()]) {
+                if let Some(&hz) = EXT_RATES.get(r[0] as usize) {
                     return Some(hz);
                 }
             }
         }
         if let Ok(Some(fi)) = self.feature(feat::REPORT_RATE) {
             if let Ok(r) = self.request(fi, 1, &[]) {
-                if let Some(hz) = r.first().and_then(|&ms| rate_from_ms(ms)) {
+                if let Some(hz) = rate_from_ms(r[0]) {
                     return Some(hz);
                 }
             }
@@ -911,44 +1249,50 @@ impl LogitechDriver {
         profile.and_then(|p| rate_from_ms(p[off::REPORT_RATE]))
     }
 
-    fn write_rate(&self, hz: i64) -> HubResult<()> {
-        let mut done = false;
-        let mut last = None;
+    /// 0x8061 / 0x8060 で今のレートを変える (オンボードモードでは本体が無視することがある)。
+    fn write_ext_rate(&self, hz: i64) -> HubResult<()> {
         if let Ok(Some(fi)) = self.feature(feat::EXT_REPORT_RATE) {
             let i = EXT_RATES
                 .iter()
                 .position(|&x| x == hz)
                 .ok_or_else(|| HubError::Invalid("report rate".into()))?;
-            match self.request_ex(fi, 3, &[i as u8], 1000, false) {
-                Ok(_) => done = true,
-                Err(e) => last = Some(e),
-            }
+            return self.write_req(fi, 3, &[i as u8]).map(|_| ());
         }
-        // 1000Hz 以下はオンボードプロファイルにも書いて電源断後も保持させる。
-        if hz <= 1000
-            && self
-                .feature(feat::ONBOARD_PROFILES)
-                .ok()
-                .flatten()
-                .is_some()
-        {
+        if let Ok(Some(fi)) = self.feature(feat::REPORT_RATE) {
+            let ms = (1000 / hz.max(1)) as u8;
+            return self.write_req(fi, 2, &[ms]).map(|_| ());
+        }
+        Err(HubError::Unsupported("report rate"))
+    }
+
+    fn write_rate(&self, hz: i64) -> HubResult<()> {
+        let onboard = self.is_onboard_mode();
+        if !onboard {
+            self.write_ext_rate(hz)?;
+            let id = self.id();
+            let mut h = load_host(&id);
+            h.rate = Some(hz);
+            save_host(&id, &h);
+            return Ok(());
+        }
+        // オンボード: 1000Hz 以下はプロファイルに書く (電源断後も保持)。
+        if hz <= 1000 && self.profile_editable() {
             let ms = (1000 / hz.max(1)) as u8;
             self.edit_active(|p| {
                 p[off::REPORT_RATE] = ms;
                 Ok(())
             })?;
-            done = true;
-        } else if !done {
-            if let Ok(Some(fi)) = self.feature(feat::REPORT_RATE) {
-                let ms = (1000 / hz.max(1)) as u8;
-                self.request_ex(fi, 2, &[ms], 1000, false)?;
-                done = true;
-            }
+            let _ = self.write_ext_rate(hz);
+            return Ok(());
         }
-        if done {
+        // それ以外は直接書いて、効いたか読み戻す (本体プロファイルが優先だと無視される)。
+        self.write_ext_rate(hz)?;
+        if self.read_rate(None) == Some(hz) {
             Ok(())
         } else {
-            Err(last.unwrap_or(HubError::Unsupported("report rate")))
+            Err(HubError::Invalid(
+                "オンボードメモリモードではレポートレートが本体プロファイルで固定されています。「オンボードメモリを使う」を OFF (ホストモード) にすると変更できます".into(),
+            ))
         }
     }
 
@@ -957,14 +1301,9 @@ impl LogitechDriver {
     fn build_caps(&self) -> Capabilities {
         use section::*;
         let rates = self.rate_options();
-        let (dpi_min, dpi_max, dpi_step) = self
-            .feature(feat::ADJUSTABLE_DPI)
-            .ok()
-            .flatten()
-            .and_then(|fi| self.request(fi, 1, &[0]).ok())
-            .and_then(|r| parse_dpi_list(&r))
-            .unwrap_or((100, 32000, 50));
+        let (dpi_min, dpi_max, dpi_step) = self.dpi_range();
         let ob = self.load_onboard().ok();
+        let has_8100 = self.has(feat::ONBOARD_PROFILES);
         let nbtn = ob
             .as_ref()
             .map(|o| (o.desc.button_count as usize).clamp(1, 16))
@@ -987,9 +1326,48 @@ impl LogitechDriver {
                     .unwrap_or_else(|| format!("ボタン {}", i + 1)),
             })
             .collect();
-        let has_ob = ob.is_some();
+        let mut settings = vec![SettingSpec::choice(
+            "polling",
+            PERFORMANCE,
+            "レポートレート",
+            rates
+                .iter()
+                .map(|&hz| {
+                    ChoiceOpt::new(
+                        hz,
+                        if hz >= 1000 {
+                            format!("{}K", hz / 1000)
+                        } else {
+                            hz.to_string()
+                        },
+                    )
+                })
+                .collect(),
+        )
+        .help("マウスの報告頻度 (Hz)")];
+        if has_8100 {
+            settings.push(
+                SettingSpec::toggle("onboard_mode", PERFORMANCE, "オンボードメモリを使う")
+                    .help("ON: 本体に保存した設定で動く (アプリを閉じても有効・ボタン割り当てはこちら)。OFF: G HUB と同じホストモード — DPI・レートをアプリが適用し、マウスの電源を入れ直すたびに常駐アプリが掛け直します"),
+            );
+        }
+        if self.dpi2202().is_some_and(|(_, c)| c.lod) {
+            settings.push(
+                SettingSpec::choice(
+                    "lod",
+                    SENSOR,
+                    "リフトオフ距離",
+                    vec![
+                        ChoiceOpt::new(1, "低"),
+                        ChoiceOpt::new(2, "中"),
+                        ChoiceOpt::new(3, "高"),
+                    ],
+                )
+                .help("持ち上げてカーソルが止まる高さ"),
+            );
+        }
         let mut actions = vec![];
-        if has_ob {
+        if ob.is_some() {
             actions.push(
                 ActionSpec::new("restore_rom", SYSTEM, "オンボード設定を工場出荷に戻す")
                     .help(
@@ -998,29 +1376,16 @@ impl LogitechDriver {
                     .danger("現在のプロファイルの DPI とボタン割り当てが既定値に戻ります"),
             );
         }
-        let has_batt = self.feature(feat::UNIFIED_BATTERY).ok().flatten().is_some()
-            || self.feature(feat::BATTERY_STATUS).ok().flatten().is_some()
+        actions.push(
+            ActionSpec::new("diag_export", SYSTEM, "診断情報を保存")
+                .help("HID++ の機能一覧・オンボードメモリの形式などをテキストに書き出します (読み取りのみ)。不具合報告に添付してください")
+                .save_file(&["txt"]),
+        );
+        let has_batt = self.has(feat::UNIFIED_BATTERY)
+            || self.has(feat::BATTERY_STATUS)
             || lock(&self.info).transport != Transport::Wired;
         Capabilities {
-            settings: vec![SettingSpec::choice(
-                "polling",
-                PERFORMANCE,
-                "レポートレート",
-                rates
-                    .iter()
-                    .map(|&hz| {
-                        ChoiceOpt::new(
-                            hz,
-                            if hz >= 1000 {
-                                format!("{}K", hz / 1000)
-                            } else {
-                                hz.to_string()
-                            },
-                        )
-                    })
-                    .collect(),
-            )
-            .help("マウスの報告頻度 (Hz)。2K 以上は受信機 (LIGHTSPEED) 接続時のみ有効な機種があります")],
+            settings,
             actions,
             profiles: ob
                 .as_ref()
@@ -1039,18 +1404,14 @@ impl LogitechDriver {
                 stage_colors: false,
                 stage_toggle: false,
                 buttons,
-                button_kinds: if has_ob {
-                    vec![
-                        ButtonActionKind::Mouse,
-                        ButtonActionKind::Key,
-                        ButtonActionKind::Media,
-                        ButtonActionKind::Dpi,
-                        ButtonActionKind::ProfileCycle,
-                        ButtonActionKind::Disabled,
-                    ]
-                } else {
-                    vec![]
-                },
+                button_kinds: vec![
+                    ButtonActionKind::Mouse,
+                    ButtonActionKind::Key,
+                    ButtonActionKind::Media,
+                    ButtonActionKind::Dpi,
+                    ButtonActionKind::ProfileCycle,
+                    ButtonActionKind::Disabled,
+                ],
                 require_left_click: true,
                 macros: None,
                 live_buttons: vec![],
@@ -1062,6 +1423,61 @@ impl LogitechDriver {
             peq: None,
             firmware_feed: None,
         }
+    }
+
+    /// プロファイルを読めるときの状態。
+    fn read_profile_state(&self, o: &Onboard) -> HubResult<(ProfileState, MouseState, Vec<u8>)> {
+        let i = self.active_profile(o);
+        let p = self.read_profile(o, i)?;
+        self.check_profile(&p)?;
+        let dpis = profile_dpis(&p);
+        let stages: Vec<DpiStage> = dpis
+            .iter()
+            .take_while(|&&d| d != 0 && d != 0xFFFF)
+            .map(|&d| stage(d as u32))
+            .collect();
+        let fi = self.ob_index()?;
+        let active = self
+            .request(fi, ob::GET_DPI_INDEX, &[])
+            .map(|r| r[0])
+            .unwrap_or(p[off::DEFAULT_DPI]) as usize;
+        let nbtn = (o.desc.button_count as usize).clamp(1, 16);
+        let buttons = (0..nbtn)
+            .map(|b| {
+                let a = off::BUTTONS + b * 4;
+                decode_button(&p[a..a + 4], &dpis, p[off::SHIFT_DPI])
+            })
+            .collect();
+        let mut names = vec![String::new(); o.desc.profile_count as usize];
+        if let Some(n) = names.get_mut(i) {
+            *n = profile_name(&p);
+        }
+        if stages.is_empty() {
+            return Err(HubError::Protocol("profile: DPI が空".into()));
+        }
+        Ok((
+            ProfileState {
+                active: i as u8,
+                names,
+            },
+            MouseState {
+                active_stage: active.min(stages.len() - 1),
+                stages,
+                buttons,
+                macros: vec![],
+                adaptive: None,
+            },
+            p,
+        ))
+    }
+}
+
+fn stage(x: u32) -> DpiStage {
+    DpiStage {
+        x,
+        y: None,
+        color: Rgb::default(),
+        enabled: true,
     }
 }
 
@@ -1094,79 +1510,67 @@ impl DeviceDriver for LogitechDriver {
 
     fn read(&self) -> HubResult<DeviceState> {
         let mut settings = BTreeMap::new();
-        let o = self.load_onboard().ok();
-        let (profile_state, mouse, prof) = match &o {
-            Some(o) => {
-                let i = self.active_profile(o);
-                let p = self.read_profile(o, i)?;
-                let dpis = profile_dpis(&p);
-                let stages: Vec<DpiStage> = dpis
-                    .iter()
-                    .take_while(|&&d| d != 0 && d != 0xFFFF)
-                    .map(|&d| DpiStage {
-                        x: d as u32,
-                        y: None,
-                        color: Rgb::default(),
-                        enabled: true,
-                    })
-                    .collect();
-                let fi = self.ob_index()?;
-                let active = self
-                    .request(fi, ob::GET_DPI_INDEX, &[])
-                    .ok()
-                    .and_then(|r| r.first().copied())
-                    .unwrap_or(p[off::DEFAULT_DPI]) as usize;
-                let nbtn = (o.desc.button_count as usize).clamp(1, 16);
-                let buttons = (0..nbtn)
-                    .map(|b| {
-                        let a = off::BUTTONS + b * 4;
-                        decode_button(&p[a..a + 4], &dpis, p[off::SHIFT_DPI])
-                    })
-                    .collect();
-                let mut names = vec![String::new(); o.desc.profile_count as usize];
-                if let Some(n) = names.get_mut(i) {
-                    *n = profile_name(&p);
-                }
-                (
-                    ProfileState {
-                        active: i as u8,
-                        names,
-                    },
-                    MouseState {
-                        active_stage: active.min(stages.len().saturating_sub(1)),
-                        stages: if stages.is_empty() {
-                            vec![DpiStage {
-                                x: 800,
-                                y: None,
-                                color: Rgb::default(),
-                                enabled: true,
-                            }]
-                        } else {
-                            stages
-                        },
-                        buttons,
-                        macros: vec![],
-                        adaptive: None,
-                    },
-                    Some(p),
-                )
-            }
+        let onboard = self.is_onboard_mode();
+        let has_8100 = self.has(feat::ONBOARD_PROFILES);
+        if has_8100 {
+            settings.insert("onboard_mode".into(), SettingValue::Bool(onboard));
+        }
+        // 1) オンボードモードでプロファイルを読める → 本体プロファイルが正。
+        let from_profile = if onboard {
+            self.load_onboard()
+                .ok()
+                .and_then(|o| self.read_profile_state(&o).ok())
+        } else {
+            None
+        };
+        let (profile_state, mouse, prof) = match from_profile {
+            Some((ps, ms, p)) => (ps, ms, Some(p)),
             None => {
-                // オンボードメモリ無し: 現在 DPI だけ (0x2201)。
-                let fi = self.need(feat::ADJUSTABLE_DPI, "dpi")?;
-                let r = self.request(fi, 2, &[0])?;
-                let dpi = u16::from_be_bytes([r[1], r[2]]) as u32;
+                // 2) ホストモード / 未対応形式: 今の DPI (0x2202/0x2201) を基準に組み立てる。
+                let (cur, lod) = self.read_dpi()?;
+                if let Some(l) = lod {
+                    settings.insert("lod".into(), SettingValue::Choice(l as i64));
+                }
+                let nbtn = self
+                    .load_onboard()
+                    .map(|o| (o.desc.button_count as usize).clamp(1, 16))
+                    .unwrap_or(5);
+                let h = load_host(&self.id());
+                let mut levels = if onboard {
+                    self.onboard_levels()
+                } else {
+                    h.stages.clone()
+                };
+                if levels.is_empty() {
+                    levels = vec![cur];
+                }
+                let ob_idx = if onboard {
+                    self.ob_index()
+                        .ok()
+                        .and_then(|fi| self.request(fi, ob::GET_DPI_INDEX, &[]).ok())
+                        .map(|r| r[0] as usize)
+                        .filter(|&i| i < levels.len() && levels[i] == cur)
+                } else {
+                    None
+                };
+                let active = ob_idx
+                    .or_else(|| levels.iter().position(|&d| d == cur))
+                    .unwrap_or_else(|| {
+                        if onboard {
+                            0
+                        } else {
+                            h.active.min(levels.len() - 1)
+                        }
+                    });
+                if !levels.contains(&cur) && !onboard {
+                    levels[active] = cur;
+                }
                 (
                     ProfileState::default(),
                     MouseState {
-                        stages: vec![DpiStage {
-                            x: dpi,
-                            y: None,
-                            color: Rgb::default(),
-                            enabled: true,
-                        }],
-                        active_stage: 0,
-                        buttons: vec![],
+                        stages: levels.iter().map(|&d| stage(d)).collect(),
+                        active_stage: active,
+                        buttons: default_buttons(nbtn),
                         macros: vec![],
                         adaptive: None,
                     },
@@ -1174,6 +1578,11 @@ impl DeviceDriver for LogitechDriver {
                 )
             }
         };
+        if !settings.contains_key("lod") {
+            if let Ok((_, Some(l))) = self.read_dpi() {
+                settings.insert("lod".into(), SettingValue::Choice(l as i64));
+            }
+        }
         if let Some(hz) = self.read_rate(prof.as_deref()) {
             settings.insert("polling".into(), SettingValue::Choice(hz));
         }
@@ -1190,17 +1599,52 @@ impl DeviceDriver for LogitechDriver {
     fn apply(&self, change: &Change) -> HubResult<()> {
         match change {
             Change::Setting { id, value } if id == "polling" => self.write_rate(value.as_choice()),
+            Change::Setting { id, value } if id == "lod" => {
+                let (cur, _) = self.read_dpi()?;
+                self.write_dpi_lod(cur, Some(value.as_choice().clamp(1, 3) as u8))
+            }
+            Change::Setting { id, value } if id == "onboard_mode" => {
+                let on = value.as_bool();
+                let sid = self.id();
+                let mut h = load_host(&sid);
+                if on {
+                    self.set_mode(true)?;
+                    h.host = false;
+                    save_host(&sid, &h);
+                } else {
+                    // ホストへ: 今の値を引き継いでから切り替える。
+                    let (cur, _) = self.read_dpi().unwrap_or((800, None));
+                    if h.stages.is_empty() {
+                        let lv = self.onboard_levels();
+                        h.stages = if lv.is_empty() { vec![cur] } else { lv };
+                        h.active = h.stages.iter().position(|&d| d == cur).unwrap_or(0);
+                    }
+                    if h.rate.is_none() {
+                        h.rate = self.read_rate(None);
+                    }
+                    h.host = true;
+                    save_host(&sid, &h);
+                    self.apply_host(&h)?;
+                }
+                // 表示中の DPI・ボタンが変わるので読み直させる。
+                self.emit(HubEvent::StateChanged(DeviceId(sid)));
+                Ok(())
+            }
             Change::DpiStages { stages, active } => {
                 let n = stages.len().clamp(1, 5);
                 let dpis: Vec<u32> = stages[..n].iter().map(|s| s.x).collect();
                 let act = (*active).min(n - 1);
-                if lock(&self.onboard).is_none() && self.load_onboard().is_err() {
-                    // オンボード無し機種: 現在値だけ 0x2201 で。
-                    let fi = self.need(feat::ADJUSTABLE_DPI, "dpi")?;
-                    let d = (dpis[act] as u16).to_be_bytes();
-                    return self
-                        .request_ex(fi, 3, &[0, d[0], d[1]], 700, false)
-                        .map(|_| ());
+                if !self.is_onboard_mode() {
+                    let sid = self.id();
+                    let mut h = load_host(&sid);
+                    h.stages = dpis.clone();
+                    h.active = act;
+                    h.host = true;
+                    save_host(&sid, &h);
+                    return self.write_dpi(dpis[act]);
+                }
+                if !self.profile_editable() {
+                    return Err(self.not_editable("DPI ステージ"));
                 }
                 self.edit_active(|p| {
                     // DPI シフト用に後ろの枠を使っていたら残す。
@@ -1217,8 +1661,24 @@ impl DeviceDriver for LogitechDriver {
                 })?;
                 self.set_dpi_index(act as u8)
             }
-            Change::ActiveStage(a) => self.set_dpi_index((*a).min(4) as u8),
+            Change::ActiveStage(a) => {
+                if !self.is_onboard_mode() {
+                    let sid = self.id();
+                    let mut h = load_host(&sid);
+                    let d = *h
+                        .stages
+                        .get(*a)
+                        .ok_or_else(|| HubError::Invalid("stage".into()))?;
+                    h.active = *a;
+                    save_host(&sid, &h);
+                    return self.write_dpi(d);
+                }
+                self.set_dpi_index((*a).min(4) as u8)
+            }
             Change::Button { slot, action } => {
+                if !self.profile_editable() {
+                    return Err(self.not_editable("ボタン割り当て"));
+                }
                 let o = self.load_onboard()?;
                 if *slot >= (o.desc.button_count as usize).clamp(1, 16) {
                     return Err(HubError::Invalid("button slot".into()));
@@ -1238,6 +1698,9 @@ impl DeviceDriver for LogitechDriver {
                 })
             }
             Change::Profile(i) => {
+                if !self.profile_editable() {
+                    return Err(self.not_editable("プロファイル切替"));
+                }
                 let o = self.ensure_user()?;
                 let addr = o
                     .dir
@@ -1246,10 +1709,13 @@ impl DeviceDriver for LogitechDriver {
                     .ok_or_else(|| HubError::Invalid("profile".into()))?;
                 let fi = self.ob_index()?;
                 let a = addr.to_be_bytes();
-                self.request_ex(fi, ob::SET_PROFILE, &[a[0], a[1]], 1000, false)
+                self.write_req(fi, ob::SET_PROFILE, &[a[0], a[1]])
                     .map(|_| ())
             }
             Change::ProfileName { index, name } => {
+                if !self.profile_editable() {
+                    return Err(self.not_editable("プロファイル名"));
+                }
                 let o = self.ensure_user()?;
                 if *index as usize != self.active_profile(&o) {
                     return Err(HubError::Invalid(
@@ -1265,9 +1731,21 @@ impl DeviceDriver for LogitechDriver {
         }
     }
 
-    fn run_action(&self, id: &str, _file: Option<&std::path::Path>) -> HubResult<ActionOutcome> {
+    fn run_action(&self, id: &str, file: Option<&std::path::Path>) -> HubResult<ActionOutcome> {
         match id {
+            "diag_export" => {
+                let path = file.ok_or_else(|| HubError::Invalid("保存先".into()))?;
+                std::fs::write(path, probe(self))
+                    .map_err(|e| HubError::Io(format!("保存できません: {e}")))?;
+                Ok(ActionOutcome {
+                    message: Some(format!("診断情報を保存しました: {}", path.display())),
+                    reload: false,
+                })
+            }
             "restore_rom" => {
+                if !self.profile_editable() {
+                    return Err(self.not_editable("工場出荷への復元"));
+                }
                 let o = self.ensure_user()?;
                 let i = self.active_profile(&o);
                 let rom = ROM_BASE
@@ -1298,12 +1776,11 @@ impl DeviceDriver for LogitechDriver {
         if let Some(fi) = self.feature(feat::UNIFIED_BATTERY)? {
             // get_status: [残量%, レベル bit, 充電状態, 外部電源]
             let r = self.request(fi, 1, &[])?;
-            let soc = r.first().copied().unwrap_or(0);
-            let level = r.get(1).copied().unwrap_or(0);
+            let soc = r[0];
             let pct = if soc != 0 {
                 soc
             } else {
-                match level {
+                match r[1] {
                     8.. => 90,
                     4..=7 => 50,
                     2..=3 => 20,
@@ -1313,46 +1790,135 @@ impl DeviceDriver for LogitechDriver {
             };
             return Ok(Battery {
                 percent: Some(pct.min(100)),
-                charging: matches!(r.get(2), Some(1) | Some(2) | Some(4)),
+                charging: matches!(r[2], 1 | 2 | 4),
             });
         }
         if let Some(fi) = self.feature(feat::BATTERY_STATUS)? {
             let r = self.request(fi, 0, &[])?;
             return Ok(Battery {
-                percent: r.first().map(|&p| p.min(100)),
-                charging: matches!(r.get(2), Some(1) | Some(2) | Some(4)),
+                percent: Some(r[0].min(100)),
+                charging: matches!(r[2], 1 | 2 | 4),
             });
         }
         Err(HubError::Unsupported("battery"))
     }
 }
 
-/// 診断用: 機能一覧とオンボードメモリの概要を文字列で返す (読み取りのみ)。
-/// `cargo run -p devhub-hid --example lgprobe` から使う。
+fn hex(b: &[u8]) -> String {
+    b.iter()
+        .map(|x| format!("{x:02x}"))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// 診断用: 機能一覧・各機能の生応答・オンボードメモリを文字列で返す (読み取りのみ)。
+/// アプリの「診断情報を保存」と `cargo run -p devhub-hid --example lgprobe` が使う。
 pub fn probe(drv: &LogitechDriver) -> String {
     let mut s = String::new();
+    let info = lock(&drv.info).clone();
+    s.push_str(&format!(
+        "Device HUB {} — Logitech HID++ 診断\n{:04x}:{:04x} {:?} name={}\n",
+        env!("CARGO_PKG_VERSION"),
+        info.vid,
+        info.pid,
+        info.transport,
+        info.name
+    ));
     s.push_str(&format!("device index: {:#04x}\n", *lock(&drv.index)));
-    if let Ok(name) = drv.read_name() {
-        s.push_str(&format!("name: {name}\n"));
+    match drv.read_name() {
+        Ok(n) => s.push_str(&format!("name(0x0005): {n}\n")),
+        Err(e) => s.push_str(&format!("name(0x0005): {e}\n")),
     }
-    if let Some(fw) = drv.read_fw() {
-        s.push_str(&format!("firmware: {fw}\n"));
-    }
+    s.push_str(&format!("firmware: {:?}\n", drv.read_fw()));
+    s.push_str("features:\n");
     for (id, n) in [
         (feat::FW_VERSION, "FW_VERSION"),
         (feat::NAME, "DEVICE_NAME"),
         (feat::BATTERY_STATUS, "BATTERY_STATUS"),
         (feat::UNIFIED_BATTERY, "UNIFIED_BATTERY"),
         (feat::ADJUSTABLE_DPI, "ADJUSTABLE_DPI"),
-        (0x2202, "EXTENDED_ADJUSTABLE_DPI"),
+        (feat::EXT_DPI, "EXTENDED_ADJUSTABLE_DPI"),
         (feat::REPORT_RATE, "REPORT_RATE"),
         (feat::EXT_REPORT_RATE, "EXTENDED_REPORT_RATE"),
+        (0x8090, "MODE_STATUS"),
         (feat::ONBOARD_PROFILES, "ONBOARD_PROFILES"),
         (0x1B04, "REPROG_CONTROLS_V4"),
         (0x8110, "MOUSE_BUTTON_SPY"),
     ] {
-        let v = drv.feature(id);
-        s.push_str(&format!("  {id:#06x} {n:<24} {v:?}\n"));
+        s.push_str(&format!("  {id:#06x} {n:<24} {:?}\n", drv.feature(id)));
+    }
+    let raw = |fid: u16, func: u8, params: &[u8]| -> String {
+        match drv.feature(fid) {
+            Ok(Some(fi)) => match drv.request(fi, func, params) {
+                Ok(r) => hex(&r),
+                Err(e) => e.to_string(),
+            },
+            Ok(None) => "-".into(),
+            Err(e) => e.to_string(),
+        }
+    };
+    s.push_str(&format!(
+        "0x2202 fn1 caps     : {}\n",
+        raw(feat::EXT_DPI, 1, &[0])
+    ));
+    s.push_str(&format!(
+        "0x2202 fn2 ranges p0: {}\n",
+        raw(feat::EXT_DPI, 2, &[0, 0, 0])
+    ));
+    s.push_str(&format!(
+        "0x2202 fn3 list     : {}\n",
+        raw(feat::EXT_DPI, 3, &[0, 0])
+    ));
+    s.push_str(&format!(
+        "0x2202 fn5 params   : {}\n",
+        raw(feat::EXT_DPI, 5, &[0])
+    ));
+    s.push_str(&format!(
+        "0x2201 fn2 dpi      : {}\n",
+        raw(feat::ADJUSTABLE_DPI, 2, &[0])
+    ));
+    s.push_str(&format!(
+        "0x8061 fn1 list     : {}\n",
+        raw(feat::EXT_REPORT_RATE, 1, &[])
+    ));
+    s.push_str(&format!(
+        "0x8061 fn2 rate     : {}\n",
+        raw(feat::EXT_REPORT_RATE, 2, &[drv.conn_type()])
+    ));
+    s.push_str(&format!(
+        "0x8100 fn0 desc     : {}\n",
+        raw(feat::ONBOARD_PROFILES, 0, &[])
+    ));
+    s.push_str(&format!(
+        "0x8100 fn2 mode     : {}\n",
+        raw(feat::ONBOARD_PROFILES, 2, &[])
+    ));
+    s.push_str(&format!(
+        "0x8100 fn4 profile  : {}\n",
+        raw(feat::ONBOARD_PROFILES, 4, &[])
+    ));
+    s.push_str(&format!(
+        "0x8100 fnB dpi idx  : {}\n",
+        raw(feat::ONBOARD_PROFILES, 0xB, &[])
+    ));
+    for (sector, label) in [
+        (0u16, "user dir"),
+        (ROM_BASE, "rom dir"),
+        (1, "sector 1"),
+        (ROM_BASE + 1, "rom 1"),
+    ] {
+        let sb = sector.to_be_bytes();
+        let mut line = String::new();
+        for off16 in [0u16, 16, 32, 48] {
+            let o = off16.to_be_bytes();
+            line.push_str(&raw(
+                feat::ONBOARD_PROFILES,
+                ob::MEM_READ,
+                &[sb[0], sb[1], o[0], o[1]],
+            ));
+            line.push_str(" | ");
+        }
+        s.push_str(&format!("0x8100 read {label:<8} {line}\n"));
     }
     match drv.load_onboard() {
         Ok(o) => {
@@ -1379,6 +1945,8 @@ pub fn probe(drv: &LogitechDriver) -> String {
         Err(e) => s.push_str(&format!("onboard: {e}\n")),
     }
     s.push_str(&format!("rates: {:?}\n", drv.rate_options()));
+    s.push_str(&format!("dpi range: {:?}\n", drv.dpi_range()));
+    s.push_str(&format!("dpi now: {:?}\n", drv.read_dpi()));
     s.push_str(&format!("battery: {:?}\n", drv.battery()));
     s
 }
@@ -1494,5 +2062,29 @@ mod tests {
         assert_eq!(profile_name(&p), "");
         let fw = [0u8, b'R', b'Q', b'M', 0x01, 0x02, 0x00, 0x34];
         assert_eq!(format_fw(&fw).as_deref(), Some("RQM 01.02.B0034"));
+    }
+
+    #[test]
+    fn ext_dpi_ranges_and_levels() {
+        // 100..(step 1)..44000 の範囲表現 + 終端。
+        let mut st = vec![];
+        for v in [100u16, 0xE000 | 1, 44000, 0] {
+            st.extend_from_slice(&v.to_be_bytes());
+        }
+        assert_eq!(parse_dpi_ranges(&st), Some((100, 44000, 1)));
+        // fn3: [sensor, dir, 400, 800, 1600, 0…]
+        let mut p = vec![0u8, 0];
+        for v in [400u16, 800, 1600, 0] {
+            p.extend_from_slice(&v.to_be_bytes());
+        }
+        p.resize(16, 0);
+        assert_eq!(parse_dpi_levels(&p), vec![400, 800, 1600]);
+    }
+
+    #[test]
+    fn ext_rate_mask_uses_byte1_only() {
+        // byte0 は無関係、byte1 = 125 | 1000 | 8000。
+        assert_eq!(ext_rate_mask(&[0xFF, 0b0100_1001]), vec![125, 1000, 8000]);
+        assert_eq!(ext_rate_mask(&[0x00, 0x7F]).len(), 7);
     }
 }

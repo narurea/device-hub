@@ -1199,6 +1199,42 @@ index、無ければステージの後ろの空き枠に値を入れて index �
   プロファイル形式番号、0x8061 の 8K がオンボードモードで受理されるか、ボタン数 (仮 5)。
   `cargo run -p devhub-hid --example lgprobe` (読み取り専用) で feature 一覧とセクタを確認できる。
 
+### 6.6 SL2 の実態 (2026-11-19、初回の実機報告から修正)
+
+初版は「DPI は 0x2201、オンボードプロファイルを常に使う」前提だったため、SL2 では読み込みが
+`この機能には対応していません: dpi` で失敗した。公開情報で確認できた SL2 (`PRO X 2`, wpid 40A9, model 40A9C09B0000) の機能:
+
+| idx | feature | 備考 |
+|---|---|---|
+| 6 | 0x1004 UnifiedBattery v3 | |
+| 9 | **0x2202 ExtendedAdjustableDPI** v0 | 0x2201 は**無い** |
+| 10 | 0x8090 ModeStatus v2 | |
+| 11 | 0x8061 ExtendedAdjustableReportRate v0 | |
+| 12 | 0x8100 OnboardProfiles v0 | 形式番号は未確認 |
+| 13 | 0x8110 MouseButtonSpy | |
+
+(出典: Solaar issue #2207 / #3353 の `solaar show`、OpenLogi の 0x2202/0x8061/0x8100 実装 — MIT/Apache)
+
+0x2202 (OpenLogi / Logi Options+ 準拠):
+fn1 caps `[sensor, dpi段数, bit0=Y 独立 / bit1=LOD]`、fn2 ranges `(sensor, dir, page)` → `[sensor, dir, page, 13B]`
+(BE16 列、`0xE000|step` は範囲、`0000` 終端)、fn3 本体プロファイルの DPI 段 `[sensor, dir, BE16…, 0]`、
+fn5 現在値 `[sensor, X BE, 既定X, Y, 既定Y, LOD 1..3]`、fn6 設定 `[sensor, X BE, Y BE (Y 非対応は 0), LOD]`。
+
+0x8061: fn0 `getDeviceCapabilities(conn)`、fn1 `getActualReportRateList` (マスクは **byte1 のみ**)、
+fn2 `getReportRate(conn)` (**conn: 0 = 有線 / 1 = ゲーミング無線**。device index 0xFF なら有線)、fn3 `setReportRate(rate)`。
+
+**オンボードモードでは本体プロファイルが DPI とレートを握る** — 0x2202/0x8061 の書き込みは ACK されても効かない
+(OpenLogi は書く前にホストモードへ渡す)。ホストモードは電源断でオンボードに戻る。
+
+現在の実装:
+- 「オンボードメモリを使う」トグル (0x8100 setMode)。OFF = ホストモード — DPI 段・レートを
+  `%APPDATA%\DeviceHub\logitech.json` に覚え、接続/覚醒のたびに常駐アプリが掛け直す。
+  ボタンはホストモードでは既定動作 (割り当ての変更はオンボードのみ)。
+- オンボードモード: 0x2202 fn3 (本体の DPI 段) とセクタから読んだ DPI 段を照合し、**一致したときだけ**
+  プロファイルを表示・書き込みに使う。不一致/未対応形式は読み取りのみ (DPI 段は fn3、現在段は 0x8100 fnB)。
+- 開いたときにモードを勝手に変えない (初版は onboard へ戻していた)。
+- アクション「診断情報を保存」で機能一覧・各機能の生応答・ディレクトリ/セクタ先頭をテキストに書き出す。
+
 ## 7. MonsGeek / Akko — RongYuan RY5088 (FUN60 Ultra)
 
 **状態: 実装済・実機未検証** (`crates/devhub-hid/src/monsgeek.rs`)。出典:
